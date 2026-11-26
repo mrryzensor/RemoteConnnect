@@ -1,0 +1,7 @@
+target
+app/target
+app/src-tauri/target
+app/node_modules
+app/dist
+.git
+*.log
