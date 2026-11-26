@@ -25,6 +25,7 @@ base64.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 xcap = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

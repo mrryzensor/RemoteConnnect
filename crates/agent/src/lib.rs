@@ -187,6 +187,7 @@ pub fn start_agent(
     config: AgentConfig,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> AgentHandle {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(run_agent_loop(config, event_tx, cmd_rx));
     AgentHandle { cmd_tx }
