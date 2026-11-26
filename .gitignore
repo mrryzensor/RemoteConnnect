@@ -1,0 +1,15 @@
+# Rust build outputs
+/target/
+app/src-tauri/target/
+**/*.rs.bk
+
+# Node / Vite frontend
+app/node_modules/
+app/dist/
+app/.vite/
+
+# Local configs & OS artifacts
+remoteconnect-config.json
+.DS_Store
+Thumbs.db
+*.log

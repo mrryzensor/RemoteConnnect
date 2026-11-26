@@ -1,0 +1,17 @@
+[package]
+name = "remoteconnect-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
+p256.workspace = true
+chrono.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "remoteconnect-desktop"
+version = "0.1.0"
+description = "RemoteConnect Desktop App (Host + Viewer)"
+authors = ["RemoteConnect"]
+edition = "2021"
+
+[lib]
+name = "remoteconnect_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.44", features = ["full"] }
+remoteconnect-protocol = { path = "../../crates/protocol" }
+remoteconnect-agent = { path = "../../crates/agent" }
+directories = "6.0"
+hostname = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
