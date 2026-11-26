@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Circle,
   Clipboard,
   Download,
   FolderOpen,
@@ -9,6 +10,7 @@ import {
   Moon,
   PhoneOff,
   Sliders,
+  Square,
   Sun,
   Volume2,
   VolumeX,
@@ -67,6 +69,12 @@ export function RemoteViewer({
   const [liveFps, setLiveFps] = useState(0);
   const [audioMuted, setAudioMuted] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+
+  // Local-only session recording (never sent to or stored on server)
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordSeconds, setRecordSeconds] = useState(0);
 
   // Remote Ctrl+C copied files notification
   const [remoteCopiedFiles, setRemoteCopiedFiles] = useState<ClipboardFileInfo[]>([]);
@@ -161,10 +169,85 @@ export function RemoteViewer({
 
     return () => {
       window.clearInterval(fpsTimer);
+      if (recorderRef.current && recorderRef.current.state !== "inactive") {
+        recorderRef.current.stop();
+      }
       client.disconnect();
       clientRef.current = null;
     };
   }, [serverUrl, targetDeviceId, viewerName, pin, authToken]);
+
+  useEffect(() => {
+    if (!isRecording) {
+      setRecordSeconds(0);
+      return;
+    }
+    const id = window.setInterval(() => setRecordSeconds((s) => s + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [isRecording]);
+
+  const toggleRecording = () => {
+    if (isRecording) {
+      if (recorderRef.current && recorderRef.current.state !== "inactive") {
+        recorderRef.current.stop();
+      }
+      setIsRecording(false);
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas || canvas.width === 0) {
+      flashToast("Espera a que cargue el video para iniciar la grabación local");
+      return;
+    }
+
+    try {
+      const videoStream = canvas.captureStream(Math.min(30, Math.max(15, fps)));
+      const tracks: MediaStreamTrack[] = [...videoStream.getVideoTracks()];
+      const audioStream = clientRef.current?.getAudioStream();
+      if (audioStream) {
+        tracks.push(...audioStream.getAudioTracks());
+      }
+      const combined = new MediaStream(tracks);
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+        ? "video/webm;codecs=vp9,opus"
+        : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
+        ? "video/webm;codecs=vp8,opus"
+        : "video/webm";
+
+      const recorder = new MediaRecorder(combined, { mimeType });
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          recordedChunksRef.current.push(ev.data);
+        }
+      };
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const safeHost = hostName.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `RemoteConnect-${safeHost}-${stamp}.webm`;
+        a.click();
+        URL.revokeObjectURL(url);
+        flashToast("Grabación guardada localmente en esta PC");
+      };
+      recorder.start(1000);
+      recorderRef.current = recorder;
+      setIsRecording(true);
+      flashToast("Grabando sesión solo en esta PC (no se guarda en el servidor)");
+    } catch {
+      flashToast("No se pudo iniciar la grabación local en este dispositivo");
+    }
+  };
+
+  const formatRecTime = (secs: number) => {
+    const m = String(Math.floor(secs / 60)).padStart(2, "0");
+    const s = String(secs % 60).padStart(2, "0");
+    return `${m}:${s}`;
+  };
 
   const applyStreamConfig = (
     nextFps: number,
@@ -383,6 +466,24 @@ export function RemoteViewer({
               {audioMuted ? "Silenciado" : "Audio"}
             </button>
           )}
+
+          <button
+            className={`btn btn-sm ${isRecording ? "btn-danger" : "btn-secondary"}`}
+            onClick={toggleRecording}
+            title="Grabar sesión localmente en esta PC (nunca se guarda en el servidor)"
+          >
+            {isRecording ? (
+              <>
+                <Square size={12} fill="currentColor" />
+                REC {formatRecTime(recordSeconds)}
+              </>
+            ) : (
+              <>
+                <Circle size={12} color="#ef4444" fill="#ef4444" />
+                Grabar
+              </>
+            )}
+          </button>
 
           <button
             className="btn btn-secondary btn-sm"

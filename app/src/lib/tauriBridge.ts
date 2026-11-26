@@ -17,6 +17,14 @@ export function isTauriEnv(): boolean {
 
 const STORAGE_KEY = "remoteconnect_web_config_v2";
 
+function defaultWebServerUrl(): string {
+  if (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/ws`;
+  }
+  return "wss://remote.2mail.us/ws";
+}
+
 function loadWebConfig(): AppConfig {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -32,7 +40,7 @@ function loadWebConfig(): AppConfig {
     custom_password: null,
     custom_password_enabled: false,
     default_permissions: { ...DEFAULT_PERMISSIONS },
-    server_url: "ws://127.0.0.1:8080/ws",
+    server_url: defaultWebServerUrl(),
     auth_token: null,
     saved_devices: [],
   };

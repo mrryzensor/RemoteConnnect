@@ -69,7 +69,7 @@ impl AppConfig {
             custom_password: None,
             custom_password_enabled: false,
             default_permissions: SessionPermissions::default(),
-            server_url: "ws://127.0.0.1:8080/ws".into(),
+            server_url: "wss://remote.2mail.us/ws".into(),
             auth_token: None,
             saved_devices: vec![],
         };

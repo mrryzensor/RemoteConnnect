@@ -51,10 +51,15 @@ export class RemoteViewerClient {
 
   // WebAudio playback engine
   private audioCtx: AudioContext | null = null;
+  private audioRecordDest: MediaStreamAudioDestinationNode | null = null;
   private nextAudioTime = 0;
   private audioMuted = false;
 
   constructor(private readonly cb: ViewerCallbacks) {}
+
+  getAudioStream(): MediaStream | null {
+    return this.audioRecordDest?.stream ?? null;
+  }
 
   setAudioMuted(muted: boolean) {
     this.audioMuted = muted;
@@ -135,6 +140,7 @@ export class RemoteViewerClient {
     if (this.audioCtx) {
       this.audioCtx.close().catch(() => {});
       this.audioCtx = null;
+      this.audioRecordDest = null;
     }
     this.nextAudioTime = 0;
     this.e2e = null;
@@ -272,6 +278,7 @@ export class RemoteViewerClient {
 
     if (!this.audioCtx) {
       this.audioCtx = new AudioContext({ sampleRate });
+      this.audioRecordDest = this.audioCtx.createMediaStreamDestination();
       this.nextAudioTime = this.audioCtx.currentTime + 0.05;
     }
     if (this.audioCtx.state === "suspended") {
@@ -293,6 +300,9 @@ export class RemoteViewerClient {
     const source = this.audioCtx.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(this.audioCtx.destination);
+    if (this.audioRecordDest) {
+      source.connect(this.audioRecordDest);
+    }
 
     const now = this.audioCtx.currentTime;
     // Prevent runaway latency drift if packets stalled
