@@ -5,6 +5,7 @@ pub mod clipboard;
 mod win_gdi;
 pub mod files;
 pub mod input;
+pub mod p2p;
 
 use std::collections::HashMap;
 use std::sync::{
@@ -31,6 +32,7 @@ use crate::clipboard::{
 };
 use crate::files::{list_directory, prepare_file_download, UploadManager};
 use crate::input::InputController;
+use crate::p2p::P2pManager;
 
 pub const PACKET_AUDIO_PCM16: u8 = 0x02;
 pub const PACKET_VIDEO_H264: u8 = 0x04;
@@ -261,6 +263,7 @@ struct RunningSession {
     e2e: Arc<E2eSession>,
     permissions: SessionPermissions,
     settings: Arc<StreamSettings>,
+    p2p: Arc<P2pManager>,
     upload_mgr: Arc<Mutex<UploadManager>>,
     last_clipboard_text: Arc<Mutex<String>>,
     last_clipboard_files: Arc<Mutex<Vec<String>>>,
@@ -384,12 +387,19 @@ async fn handle_connection(
     let mut sessions: HashMap<String, RunningSession> = HashMap::new();
     let mut pending: HashMap<String, PendingApproval> = HashMap::new();
     let input_tx = spawn_input_worker();
+    let (p2p_in_tx, mut p2p_in_rx) = mpsc::unbounded_channel::<(String, SessionMessage)>();
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
     let mut stop_requested = false;
 
     loop {
         tokio::select! {
+            Some((sid, smsg)) = p2p_in_rx.recv() => {
+                if let Some(sess) = sessions.get(&sid) {
+                    handle_session_message(&sid, smsg, sess, &input_tx, &out_tx);
+                }
+            }
+
             _ = ping_interval.tick() => {
                 let ts = chrono::Utc::now().timestamp_millis() as u64;
                 send_ws_signal(&out_tx, &SignalMessage::Ping { timestamp: ts });
@@ -417,6 +427,7 @@ async fn handle_connection(
                     Some(AgentCommand::DisconnectSession { session_id }) => {
                         if let Some(mut s) = sessions.remove(&session_id) {
                             s.settings.active.store(false, Ordering::Relaxed);
+                            s.p2p.close();
                             if let Some(tx) = s.stop_tx.take() { let _ = tx.send(()); }
                         }
                         send_ws_signal(&out_tx, &SignalMessage::Disconnect {
@@ -438,6 +449,7 @@ async fn handle_connection(
                                     permissions,
                                     &out_tx,
                                     &video_tx,
+                                    &p2p_in_tx,
                                     event_tx,
                                     &mut sessions,
                                 );
@@ -495,6 +507,7 @@ async fn handle_connection(
                                     config.default_permissions,
                                     &out_tx,
                                     &video_tx,
+                                    &p2p_in_tx,
                                     event_tx,
                                     &mut sessions,
                                 );
@@ -540,6 +553,7 @@ async fn handle_connection(
                         SignalMessage::Disconnect { session_id, reason } => {
                             if let Some(mut s) = sessions.remove(&session_id) {
                                 s.settings.active.store(false, Ordering::Relaxed);
+                                s.p2p.close();
                                 if let Some(tx) = s.stop_tx.take() { let _ = tx.send(()); }
                             }
                             pending.remove(&session_id);
@@ -565,6 +579,7 @@ async fn handle_connection(
 
     for (sid, mut sess) in sessions.drain() {
         sess.settings.active.store(false, Ordering::Relaxed);
+        sess.p2p.close();
         if let Some(tx) = sess.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -591,6 +606,7 @@ fn start_session(
     permissions: SessionPermissions,
     out_tx: &mpsc::UnboundedSender<WsMessage>,
     video_tx: &mpsc::Sender<WsMessage>,
+    p2p_in_tx: &mpsc::UnboundedSender<(String, SessionMessage)>,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     sessions: &mut HashMap<String, RunningSession>,
 ) {
@@ -629,6 +645,23 @@ fn start_session(
     );
 
     let settings = Arc::new(StreamSettings::new());
+    let p2p = {
+        let sid_ctrl = session_id.clone();
+        let p2p_tx = p2p_in_tx.clone();
+        let settings_kf = settings.clone();
+        P2pManager::spawn(
+            session_id.clone(),
+            e2e.clone(),
+            out_tx.clone(),
+            move |smsg| {
+                let _ = p2p_tx.send((sid_ctrl.clone(), smsg));
+            },
+            move || {
+                settings_kf.force_keyframe.store(true, Ordering::Release);
+                settings_kf.wake_capture();
+            },
+        )
+    };
     let last_clipboard_text = Arc::new(Mutex::new(get_clipboard_text().unwrap_or_default()));
     let initial_files: Vec<String> = get_clipboard_files()
         .into_iter()
@@ -643,6 +676,7 @@ fn start_session(
         let e2e = e2e.clone();
         let active = settings.active.clone();
         let out_tx = out_tx.clone();
+        let p2p_audio = p2p.clone();
         let mut audio_rx = spawn_audio_capture(active.clone());
 
         tokio::spawn(async move {
@@ -656,6 +690,12 @@ fn start_session(
                 plain.extend_from_slice(&chunk.channels.to_be_bytes());
                 plain.extend_from_slice(&chunk.pcm_i16_le);
 
+                // Prefer direct WebRTC P2P DataChannel when open; fallback to E2E relay
+                if p2p_audio.is_media_ready() {
+                    let _ = p2p_audio.try_send_media(plain);
+                    continue;
+                }
+
                 if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
                     let mut packet = Vec::with_capacity(36 + encrypted.len());
                     packet.extend_from_slice(sid.as_bytes());
@@ -668,12 +708,13 @@ fn start_session(
         });
     }
 
-    // 2. Spawn dedicated OS thread for H.264 capture + encoding (zero bufferbloat!)
+    // 2. Spawn dedicated OS thread for H.264 capture + encoding (P2P direct with automatic relay fallback)
     {
         let sid = session_id.clone();
         let e2e = e2e.clone();
         let settings = settings.clone();
         let video_tx = video_tx.clone();
+        let p2p_video = p2p.clone();
 
         std::thread::spawn(move || {
             if let Ok(mut guard) = settings.capture_thread.lock() {
@@ -683,8 +724,14 @@ fn start_session(
             let session_start = Instant::now();
 
             while settings.active.load(Ordering::Relaxed) {
-                // Backpressure: if network hasn't drained previous frame, wait briefly before encoding
-                if video_tx.capacity() == 0 {
+                let using_p2p = p2p_video.is_media_ready();
+                // Backpressure: if transport hasn't drained previous frame, wait briefly before encoding
+                let saturated = if using_p2p {
+                    p2p_video.media_capacity() == 0
+                } else {
+                    video_tx.capacity() == 0
+                };
+                if saturated {
                     std::thread::park_timeout(Duration::from_millis(3));
                     continue;
                 }
@@ -715,7 +762,10 @@ fn start_session(
                         plain.extend_from_slice(&ts_ms.to_be_bytes());
                         plain.extend_from_slice(&encoded.h264_annex_b);
 
-                        if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
+                        if p2p_video.is_media_ready() {
+                            // Direct P2P (DTLS-encrypted UDP/SCTP) — bypasses relay server completely!
+                            let _ = p2p_video.send_media_blocking(plain);
+                        } else if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
                             let mut packet = Vec::with_capacity(36 + encrypted.len());
                             packet.extend_from_slice(sid.as_bytes());
                             packet.extend_from_slice(&encrypted);
@@ -810,6 +860,7 @@ fn start_session(
             e2e,
             permissions,
             settings,
+            p2p,
             upload_mgr: Arc::new(Mutex::new(UploadManager::default())),
             last_clipboard_text,
             last_clipboard_files,
@@ -862,6 +913,18 @@ fn handle_session_message(
         SessionMessage::RequestKeyframe => {
             sess.settings.force_keyframe.store(true, Ordering::Release);
             sess.settings.wake_capture();
+        }
+
+        SessionMessage::RtcOffer { sdp } => {
+            sess.p2p.handle_offer(sdp);
+        }
+
+        SessionMessage::RtcIceCandidate {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+        } => {
+            sess.p2p.handle_ice_candidate(candidate, sdp_mid, sdp_mline_index);
         }
 
         SessionMessage::MouseMove { x, y } => {
@@ -1036,7 +1099,7 @@ fn send_ws_signal(out_tx: &mpsc::UnboundedSender<WsMessage>, msg: &SignalMessage
     }
 }
 
-fn send_encrypted_session_msg(
+pub(crate) fn send_encrypted_session_msg(
     out_tx: &mpsc::UnboundedSender<WsMessage>,
     session_id: &str,
     e2e: &E2eSession,

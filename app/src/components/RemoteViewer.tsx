@@ -78,6 +78,7 @@ export function RemoteViewer({
   const [liveFps, setLiveFps] = useState(0);
   const [liveKbps, setLiveKbps] = useState(0);
   const [rttMs, setRttMs] = useState<number | null>(null);
+  const [transportMode, setTransportMode] = useState<"p2p" | "relay">("relay");
   const [audioMuted, setAudioMuted] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -185,6 +186,12 @@ export function RemoteViewer({
       },
       onDecoderError: (msg) => {
         flashToast(msg);
+      },
+      onTransportChange: (mode) => {
+        setTransportMode(mode);
+        if (mode === "p2p") {
+          flashToast("Conexión directa P2P activa (latencia mínima)");
+        }
       },
       onMetrics: (m) => {
         if (m.rttMs !== undefined) setRttMs(m.rttMs);
@@ -582,7 +589,7 @@ export function RemoteViewer({
           <strong style={{ fontSize: 14 }}>{hostName}</strong>
           <span className="viewer-badge">
             <Zap size={11} />
-            H.264 HW
+            {transportMode === "p2p" ? "P2P Directo" : "Relay"}
           </span>
           <span className="viewer-badge">
             <Lock size={11} />

@@ -25,6 +25,7 @@ export interface ViewerCallbacks {
   onVideoFrame: (frame: VideoFrame) => void;
   onBitmapFrame?: (bitmap: ImageBitmap, width: number, height: number) => void;
   onDecoderError?: (message: string) => void;
+  onTransportChange?: (mode: "p2p" | "relay") => void;
   onMetrics: (metrics: { rttMs?: number; bytesReceived?: number }) => void;
   onClipboard: (text: string) => void;
   onClipboardFiles: (files: ClipboardFileInfo[]) => void;
@@ -63,6 +64,19 @@ export class RemoteViewerClient {
   // Ordered crypto/decode queues (prevents H.264 frame & input reordering under async WebCrypto)
   private binaryQueue: Promise<void> = Promise.resolve();
   private sendQueue: Promise<void> = Promise.resolve();
+
+  // Direct WebRTC P2P DataChannels (LAN / STUN UDP, automatic fallback to WS relay)
+  private rtcPc: RTCPeerConnection | null = null;
+  private rtcControlDc: RTCDataChannel | null = null;
+  private rtcMediaDc: RTCDataChannel | null = null;
+  private p2pControlReady = false;
+  private p2pMediaReady = false;
+  private rtcRemoteDescSet = false;
+  private pendingRemoteIce: RTCIceCandidateInit[] = [];
+  private p2pChunks = new Map<
+    number,
+    { total: number; received: number; parts: Array<Uint8Array | null> }
+  >();
 
   // WebAudio playback engine
   private audioCtx: AudioContext | null = null;
@@ -210,12 +224,22 @@ export class RemoteViewerClient {
         })
       );
 
-      // Measure RTT ping every 3 seconds
+      // Measure RTT ping every 2.5 seconds (uses P2P control channel when active!)
       this.pingTimer = window.setInterval(() => {
+        if (this.p2pControlReady && this.rtcControlDc?.readyState === "open") {
+          try {
+            this.rtcControlDc.send(
+              JSON.stringify({ kind: "p2p_ping", timestamp: Date.now() })
+            );
+            return;
+          } catch {
+            // fallback to ws ping
+          }
+        }
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
           this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
         }
-      }, 3000);
+      }, 2500);
     };
 
     ws.onmessage = (event) => {
@@ -237,7 +261,9 @@ export class RemoteViewerClient {
       if (this.ws === ws) {
         this.ws = null;
         this.e2e = null;
-        this.closeVideoDecoder();
+        this.closeP2p();
+        this.closeP2p();
+    this.closeVideoDecoder();
         if (this.pingTimer !== null) {
           window.clearInterval(this.pingTimer);
           this.pingTimer = null;
@@ -266,6 +292,7 @@ export class RemoteViewerClient {
       this.ws = null;
       old.close();
     }
+    this.closeP2p();
     this.closeVideoDecoder();
     if (this.audioCtx) {
       this.audioCtx.close().catch(() => {});
@@ -316,6 +343,7 @@ export class RemoteViewerClient {
         this.e2e = await this.keyPair.deriveSession(hostPub, sessionId);
         await this.initVideoDecoder();
         this.requestKeyframe();
+        void this.startP2pNegotiation();
 
         const permissions: SessionPermissions =
           (msg.permissions as SessionPermissions) || { ...DEFAULT_PERMISSIONS };
@@ -366,6 +394,198 @@ export class RemoteViewerClient {
     }
   }
 
+  private closeP2p() {
+    const wasP2p = this.p2pMediaReady || this.p2pControlReady;
+    this.p2pControlReady = false;
+    this.p2pMediaReady = false;
+    this.rtcRemoteDescSet = false;
+    this.pendingRemoteIce = [];
+    this.p2pChunks.clear();
+    if (this.rtcControlDc) {
+      try {
+        this.rtcControlDc.close();
+      } catch {
+        // ignore
+      }
+      this.rtcControlDc = null;
+    }
+    if (this.rtcMediaDc) {
+      try {
+        this.rtcMediaDc.close();
+      } catch {
+        // ignore
+      }
+      this.rtcMediaDc = null;
+    }
+    if (this.rtcPc) {
+      try {
+        this.rtcPc.close();
+      } catch {
+        // ignore
+      }
+      this.rtcPc = null;
+    }
+    if (wasP2p) {
+      this.cb.onTransportChange?.("relay");
+    }
+  }
+
+  private async startP2pNegotiation() {
+    if (typeof RTCPeerConnection === "undefined") return;
+    this.closeP2p();
+
+    try {
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: [
+              "stun:stun.cloudflare.com:3478",
+              "stun:stun.l.google.com:19302",
+            ],
+          },
+        ],
+      });
+      this.rtcPc = pc;
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate && ev.candidate.candidate) {
+          void this.sendEncryptedViaWs({
+            kind: "rtc_ice_candidate",
+            candidate: ev.candidate.candidate,
+            sdp_mid: ev.candidate.sdpMid ?? null,
+            sdp_mline_index: ev.candidate.sdpMLineIndex ?? null,
+          });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (
+          pc.connectionState === "failed" ||
+          pc.connectionState === "disconnected" ||
+          pc.connectionState === "closed"
+        ) {
+          if (this.rtcPc === pc) {
+            this.closeP2p();
+          }
+        }
+      };
+
+      const controlDc = pc.createDataChannel("control", { ordered: true });
+      this.rtcControlDc = controlDc;
+      controlDc.onopen = () => {
+        if (this.rtcControlDc !== controlDc) return;
+        this.p2pControlReady = true;
+        // Immediate P2P RTT probe
+        try {
+          controlDc.send(JSON.stringify({ kind: "p2p_ping", timestamp: Date.now() }));
+        } catch {
+          // ignore
+        }
+      };
+      controlDc.onclose = () => {
+        if (this.rtcControlDc === controlDc) {
+          this.p2pControlReady = false;
+        }
+      };
+      controlDc.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const inner = JSON.parse(ev.data) as Record<string, unknown>;
+            this.handleSessionMessage(inner);
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      const mediaDc = pc.createDataChannel("media", { ordered: true });
+      mediaDc.binaryType = "arraybuffer";
+      this.rtcMediaDc = mediaDc;
+      mediaDc.onopen = () => {
+        if (this.rtcMediaDc !== mediaDc) return;
+        this.p2pMediaReady = true;
+        this.cb.onTransportChange?.("p2p");
+        this.requestKeyframe();
+      };
+      mediaDc.onclose = () => {
+        if (this.rtcMediaDc === mediaDc) {
+          this.p2pMediaReady = false;
+          this.cb.onTransportChange?.("relay");
+        }
+      };
+      mediaDc.onmessage = (ev) => {
+        if (ev.data instanceof ArrayBuffer) {
+          this.handleP2pMediaChunk(ev.data);
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (offer.sdp) {
+        await this.sendEncryptedViaWs({ kind: "rtc_offer", sdp: offer.sdp });
+      }
+    } catch (err) {
+      console.warn("WebRTC P2P negotiation failed (using relay):", err);
+      this.closeP2p();
+    }
+  }
+
+  private handleP2pMediaChunk(buffer: ArrayBuffer) {
+    this.cb.onMetrics({ bytesReceived: buffer.byteLength });
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length <= 6) return;
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, 6);
+    const msgId = view.getUint16(0, false);
+    const chunkIdx = view.getUint16(2, false);
+    const totalChunks = view.getUint16(4, false);
+    const payload = bytes.subarray(6);
+
+    if (totalChunks <= 1) {
+      void this.handlePlainMediaPacket(payload);
+      return;
+    }
+
+    if (chunkIdx >= totalChunks) return;
+
+    let entry = this.p2pChunks.get(msgId);
+    if (!entry) {
+      if (this.p2pChunks.size > 8) {
+        const oldestKey = this.p2pChunks.keys().next().value;
+        if (oldestKey !== undefined) this.p2pChunks.delete(oldestKey);
+      }
+      entry = {
+        total: totalChunks,
+        received: 0,
+        parts: new Array<Uint8Array | null>(totalChunks).fill(null),
+      };
+      this.p2pChunks.set(msgId, entry);
+    }
+
+    if (entry.parts[chunkIdx] === null) {
+      // Copy chunk slice because underlying buffer may be reused
+      entry.parts[chunkIdx] = new Uint8Array(payload);
+      entry.received++;
+    }
+
+    if (entry.received === entry.total) {
+      this.p2pChunks.delete(msgId);
+      let totalLen = 0;
+      for (const p of entry.parts) {
+        if (p) totalLen += p.length;
+      }
+      const full = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const p of entry.parts) {
+        if (p) {
+          full.set(p, offset);
+          offset += p.length;
+        }
+      }
+      void this.handlePlainMediaPacket(full);
+    }
+  }
+
   private async handleBinaryPacket(buffer: ArrayBuffer) {
     if (!this.e2e) return;
     this.cb.onMetrics({ bytesReceived: buffer.byteLength });
@@ -380,6 +600,10 @@ export class RemoteViewerClient {
     } catch {
       return;
     }
+    await this.handlePlainMediaPacket(plain);
+  }
+
+  private async handlePlainMediaPacket(plain: Uint8Array) {
     if (plain.length < 2) return;
 
     const packetType = plain[0];
@@ -560,10 +784,54 @@ export class RemoteViewerClient {
         this.cb.onFileStatus(Boolean(msg.ok), String(msg.message || ""));
         break;
       }
+
+      case "rtc_answer": {
+        const sdp = msg.sdp as string | undefined;
+        if (sdp && this.rtcPc) {
+          void this.rtcPc
+            .setRemoteDescription({ type: "answer", sdp })
+            .then(async () => {
+              this.rtcRemoteDescSet = true;
+              const queued = this.pendingRemoteIce.splice(0);
+              for (const cand of queued) {
+                await this.rtcPc?.addIceCandidate(cand).catch(() => {});
+              }
+            })
+            .catch(() => {
+              this.closeP2p();
+            });
+        }
+        break;
+      }
+
+      case "rtc_ice_candidate": {
+        const candidate = msg.candidate as string | undefined;
+        if (candidate && this.rtcPc) {
+          const init: RTCIceCandidateInit = {
+            candidate,
+            sdpMid: (msg.sdp_mid as string | null) ?? undefined,
+            sdpMLineIndex: (msg.sdp_mline_index as number | null) ?? undefined,
+          };
+          if (!this.rtcRemoteDescSet) {
+            this.pendingRemoteIce.push(init);
+          } else {
+            void this.rtcPc.addIceCandidate(init).catch(() => {});
+          }
+        }
+        break;
+      }
+
+      case "p2p_pong": {
+        const sentTs = Number(msg.timestamp || 0);
+        if (sentTs > 0) {
+          this.cb.onMetrics({ rttMs: Math.max(1, Date.now() - sentTs) });
+        }
+        break;
+      }
     }
   }
 
-  private sendEncrypted(inner: Record<string, unknown>): Promise<void> {
+  private sendEncryptedViaWs(inner: Record<string, unknown>): Promise<void> {
     const task = this.sendQueue.then(async () => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.e2e || !this.sessionId) {
         return;
@@ -581,6 +849,18 @@ export class RemoteViewerClient {
     });
     this.sendQueue = task.catch(() => {});
     return task;
+  }
+
+  private sendEncrypted(inner: Record<string, unknown>): Promise<void> {
+    if (this.p2pControlReady && this.rtcControlDc?.readyState === "open") {
+      try {
+        this.rtcControlDc.send(JSON.stringify(inner));
+        return Promise.resolve();
+      } catch {
+        this.p2pControlReady = false;
+      }
+    }
+    return this.sendEncryptedViaWs(inner);
   }
 
   requestKeyframe() {

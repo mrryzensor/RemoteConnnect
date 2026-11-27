@@ -231,6 +231,23 @@ pub enum SessionMessage {
         ok: bool,
         message: String,
     },
+
+    /// WebRTC P2P SDP Offer (Viewer -> Host, relayed E2E over signaling server).
+    RtcOffer { sdp: String },
+
+    /// WebRTC P2P SDP Answer (Host -> Viewer, relayed E2E over signaling server).
+    RtcAnswer { sdp: String },
+
+    /// WebRTC P2P Trickle ICE candidate (bidirectional, relayed E2E over signaling server).
+    RtcIceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
+
+    /// Direct P2P RTT measurement ping/pong over WebRTC control DataChannel.
+    P2pPing { timestamp: u64 },
+    P2pPong { timestamp: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
