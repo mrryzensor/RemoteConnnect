@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   ChevronDown,
+  ChevronUp,
   Circle,
   Clipboard,
   Download,
@@ -96,6 +97,10 @@ export function RemoteViewer({
     altGr: boolean;
   }>({ ctrl: false, shift: false, win: false, alt: false, altGr: false });
   const mobileInputRef = useRef<HTMLInputElement>(null);
+  const [virtualCursor, setVirtualCursor] = useState<{ x: number; y: number }>({
+    x: 0.5,
+    y: 0.5,
+  });
   const virtualCursorRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
 
   const updateZoom = (nextZoom: number) => {
@@ -546,6 +551,10 @@ export function RemoteViewer({
   const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
     lastTouchTimeRef.current = performance.now();
     clientRef.current?.resumeAudio();
+    if (isFullscreen && toolbarRevealed) {
+      setToolbarRevealed(false);
+      setShowSettings(false);
+    }
     if (!permissions.allow_input || e.touches.length === 0) return;
     const ts = touchStateRef.current;
     if (ts.longPressTimer !== null) {
@@ -669,6 +678,7 @@ export function RemoteViewer({
       const nx = Math.max(0, Math.min(1, virtualCursorRef.current.x + dx));
       const ny = Math.max(0, Math.min(1, virtualCursorRef.current.y + dy));
       virtualCursorRef.current = { x: nx, y: ny };
+      setVirtualCursor({ x: nx, y: ny });
 
       // RustDesk-style auto-follow: pan the zoomed screen smoothly to follow the cursor
       if (zoomRef.current > 1.02) {
@@ -1039,7 +1049,8 @@ export function RemoteViewer({
                 onClick={() => {
                   const next = touchMode === "touch" ? "cursor" : "touch";
                   setTouchMode(next);
-                  applyStreamConfig(fps, bitrateKbps, selectedDisplay, scale, next === "cursor");
+                  // Keep remote host cursor hidden to avoid double cursor; we draw a crisp 0ms SVG pointer locally
+                  applyStreamConfig(fps, bitrateKbps, selectedDisplay, scale, false);
                   if (next === "cursor") {
                     clientRef.current?.sendMouseMove(
                       virtualCursorRef.current.x,
@@ -1048,7 +1059,7 @@ export function RemoteViewer({
                   }
                   flashToast(
                     next === "cursor"
-                      ? "Modo Cursor real: desliza como touchpad, toca para clic"
+                      ? "Modo Cursor: arrastra para mover, toca para clic"
                       : "Modo Táctil directo: toca directamente donde quieras hacer clic"
                   );
                 }}
@@ -1199,6 +1210,20 @@ export function RemoteViewer({
             <PhoneOff size={14} />
             Desconectar
           </button>
+
+          {isFullscreen && toolbarRevealed && (
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => {
+                setToolbarRevealed(false);
+                setShowSettings(false);
+              }}
+              title="Ocultar barra de menú"
+            >
+              <ChevronUp size={14} />
+              Ocultar
+            </button>
+          )}
         </div>
       </div>
 
@@ -1296,19 +1321,39 @@ export function RemoteViewer({
             transformOrigin: "center center",
           }}
         >
-          <canvas
-            ref={canvasRef}
-            className="viewer-canvas"
-            style={{ touchAction: "none" }}
-            onMouseMove={handleMouseMove}
-            onMouseDown={handleMouseDown}
-            onMouseUp={handleMouseUp}
-            onWheel={handleWheel}
-            onTouchStart={handleTouchStart}
-            onTouchMove={handleTouchMove}
-            onTouchEnd={handleTouchEnd}
-            onContextMenu={(e) => e.preventDefault()}
-          />
+          <div className="viewer-canvas-box">
+            <canvas
+              ref={canvasRef}
+              className="viewer-canvas"
+              style={{ touchAction: "none" }}
+              onMouseMove={handleMouseMove}
+              onMouseDown={handleMouseDown}
+              onMouseUp={handleMouseUp}
+              onWheel={handleWheel}
+              onTouchStart={handleTouchStart}
+              onTouchMove={handleTouchMove}
+              onTouchEnd={handleTouchEnd}
+              onContextMenu={(e) => e.preventDefault()}
+            />
+            {isTouchDevice && touchMode === "cursor" && (
+              <svg
+                className="virtual-cursor-arrow"
+                viewBox="0 0 24 24"
+                style={{
+                  left: `${virtualCursor.x * 100}%`,
+                  top: `${virtualCursor.y * 100}%`,
+                }}
+              >
+                <path
+                  d="M4 2 L4 20 L9 15 L13 22 L15.6 20.6 L11.8 14 L18.5 14 Z"
+                  fill="#ffffff"
+                  stroke="#0f172a"
+                  strokeWidth="1.8"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            )}
+          </div>
         </div>
 
         {remoteCopiedFiles.length > 0 && permissions.allow_file_transfer && (
