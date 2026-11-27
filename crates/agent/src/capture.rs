@@ -410,6 +410,7 @@ impl H264ScreenCapturer {
         bitrate_kbps: u32,
         fps: u8,
         force_keyframe: bool,
+        show_cursor: bool,
         _ts_ms: u32,
     ) -> Result<CaptureOutcome> {
         let clamped_scale = scale.clamp(0.35, 1.0);
@@ -423,7 +424,7 @@ impl H264ScreenCapturer {
             }
 
             if let Some(mut gdi) = self.win_gdi.take() {
-                match gdi.capture_bgra() {
+                match gdi.capture_bgra(show_cursor) {
                     Ok((bgra, src_w, src_h)) => {
                         let hash = fast_frame_hash(bgra);
                         if !force_keyframe && hash == self.prev_hash && self.idle_frames_skipped < 90 {

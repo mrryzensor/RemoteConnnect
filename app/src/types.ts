@@ -29,6 +29,7 @@ export interface UserPreferences {
   mute_audio_on_connect: boolean;
   prefer_p2p: boolean;
   ui_mode: "auto" | "webview" | "native";
+  right_click_gesture: "long_press" | "two_finger_tap";
 }
 
 export const DEFAULT_PREFERENCES: UserPreferences = {
@@ -41,6 +42,7 @@ export const DEFAULT_PREFERENCES: UserPreferences = {
   mute_audio_on_connect: false,
   prefer_p2p: true,
   ui_mode: "auto",
+  right_click_gesture: "long_press",
 };
 
 export interface AppConfig {

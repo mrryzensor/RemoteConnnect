@@ -16,6 +16,9 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
     SRCCOPY,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO,
+};
 
 use crate::capture::{get_display_bounds, DisplayBounds};
 
@@ -102,8 +105,10 @@ impl WinGdiCapturer {
         }
     }
 
-    /// Capture the monitor directly into the persistent BGRA DIB buffer (without the host cursor).
-    pub fn capture_bgra(&mut self) -> Result<(&[u8], usize, usize)> {
+    /// Capture the monitor directly into the persistent BGRA DIB buffer.
+    /// When `draw_cursor` is true (e.g. Android Cursor/Trackpad mode), overlays the real
+    /// Windows system cursor (arrow, hand, I-beam, resize, etc.) at its exact hotspot.
+    pub fn capture_bgra(&mut self, draw_cursor: bool) -> Result<(&[u8], usize, usize)> {
         unsafe {
             BitBlt(
                 self.mem_dc,
@@ -117,6 +122,42 @@ impl WinGdiCapturer {
                 SRCCOPY,
             )
             .map_err(|e| anyhow!("BitBlt failed: {:?}", e))?;
+
+            if draw_cursor {
+                let mut ci = CURSORINFO {
+                    cbSize: mem::size_of::<CURSORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetCursorInfo(&mut ci).is_ok()
+                    && (ci.flags.0 & CURSOR_SHOWING.0) != 0
+                    && !ci.hCursor.is_invalid()
+                {
+                    let mut x = ci.ptScreenPos.x - self.bounds.x;
+                    let mut y = ci.ptScreenPos.y - self.bounds.y;
+                    let mut ii = ICONINFO::default();
+                    if GetIconInfo(ci.hCursor.into(), &mut ii).is_ok() {
+                        x -= ii.xHotspot as i32;
+                        y -= ii.yHotspot as i32;
+                        if !ii.hbmMask.is_invalid() {
+                            let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+                        }
+                        if !ii.hbmColor.is_invalid() {
+                            let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+                        }
+                    }
+                    let _ = DrawIconEx(
+                        self.mem_dc,
+                        x,
+                        y,
+                        ci.hCursor.into(),
+                        0,
+                        0,
+                        0,
+                        None,
+                        DI_NORMAL,
+                    );
+                }
+            }
 
             let slice = std::slice::from_raw_parts(self.bits_ptr, self.byte_len);
             Ok((slice, self.bounds.width as usize, self.bounds.height as usize))

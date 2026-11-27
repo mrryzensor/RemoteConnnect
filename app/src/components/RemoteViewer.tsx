@@ -82,6 +82,10 @@ export function RemoteViewer({
       window.matchMedia?.("(pointer: coarse)").matches);
 
   const [touchMode, setTouchMode] = useState<"touch" | "cursor">("touch");
+  const [zoom, setZoom] = useState<number>(1.0);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const zoomRef = useRef<number>(1.0);
+  const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const [showSpecialKeys, setShowSpecialKeys] = useState<boolean>(isTouchDevice);
   const [stickyMods, setStickyMods] = useState<{
     ctrl: boolean;
@@ -91,11 +95,17 @@ export function RemoteViewer({
     altGr: boolean;
   }>({ ctrl: false, shift: false, win: false, alt: false, altGr: false });
   const mobileInputRef = useRef<HTMLInputElement>(null);
-  const [virtualCursor, setVirtualCursor] = useState<{ x: number; y: number }>({
-    x: 0.5,
-    y: 0.5,
-  });
   const virtualCursorRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
+
+  const updateZoom = (nextZoom: number) => {
+    const clamped = Math.max(1.0, Math.min(4.0, Math.round(nextZoom * 20) / 20));
+    zoomRef.current = clamped;
+    setZoom(clamped);
+    if (clamped <= 1.01) {
+      panRef.current = { x: 0, y: 0 };
+      setPan({ x: 0, y: 0 });
+    }
+  };
 
   const [status, setStatus] = useState<
     "connecting" | "waiting_approval" | "connected" | "disconnected"
@@ -419,17 +429,21 @@ export function RemoteViewer({
     nextFps: number,
     nextBitrateKbps: number,
     nextDisplay: number,
-    nextScale: number
+    nextScale: number,
+    nextShowCursor?: boolean
   ) => {
     setFps(nextFps);
     setBitrateKbps(nextBitrateKbps);
     setSelectedDisplay(nextDisplay);
     setScale(nextScale);
+    const cursorFlag =
+      nextShowCursor !== undefined ? nextShowCursor : isTouchDevice && touchMode === "cursor";
     clientRef.current?.sendStreamConfig(
       nextFps,
       nextBitrateKbps,
       nextDisplay,
-      nextScale
+      nextScale,
+      cursorFlag
     );
   };
 
@@ -480,8 +494,10 @@ export function RemoteViewer({
   };
 
   // Touch support for Android / tablets:
-  // - "touch" mode: direct tap = left click at finger, long-press = right click, drag = move, 2-finger = scroll
-  // - "cursor" mode (trackpad): 1-finger drag moves virtual cursor relatively, tap = left click at cursor, long-press = right click at cursor, 2-finger = scroll
+  // - "touch" mode: direct tap = left click at finger, drag = move
+  // - "cursor" mode: moves the REAL Windows cursor on the host like a laptop trackpad
+  // - Right click: configurable via `right_click_gesture` ("long_press" default, or "two_finger_tap")
+  // - 2-finger pinch = zoom (1x..4x), 2-finger drag = pan when zoomed or scroll at 1x
   const touchStateRef = useRef<{
     startX: number;
     startY: number;
@@ -490,6 +506,12 @@ export function RemoteViewer({
     moved: boolean;
     longPressTimer: number | null;
     rightClicked: boolean;
+    twoFingerStartDist: number;
+    twoFingerStartZoom: number;
+    twoFingerMidX: number;
+    twoFingerMidY: number;
+    twoFingerMoved: boolean;
+    wasTwoFinger: boolean;
   }>({
     startX: 0,
     startY: 0,
@@ -498,6 +520,12 @@ export function RemoteViewer({
     moved: false,
     longPressTimer: null,
     rightClicked: false,
+    twoFingerStartDist: 0,
+    twoFingerStartZoom: 1,
+    twoFingerMidX: 0,
+    twoFingerMidY: 0,
+    twoFingerMoved: false,
+    wasTwoFinger: false,
   });
 
   const getTouchNorm = (touch: React.Touch, el: HTMLCanvasElement) => {
@@ -516,6 +544,20 @@ export function RemoteViewer({
       window.clearTimeout(ts.longPressTimer);
       ts.longPressTimer = null;
     }
+
+    if (e.touches.length === 2) {
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      ts.wasTwoFinger = true;
+      ts.twoFingerMoved = false;
+      ts.twoFingerStartDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      ts.twoFingerStartZoom = zoomRef.current;
+      ts.twoFingerMidX = (t0.clientX + t1.clientX) / 2;
+      ts.twoFingerMidY = (t0.clientY + t1.clientY) / 2;
+      ts.lastY = ts.twoFingerMidY;
+      return;
+    }
+
     const t = e.touches[0];
     ts.startX = t.clientX;
     ts.startY = t.clientY;
@@ -523,19 +565,23 @@ export function RemoteViewer({
     ts.lastY = t.clientY;
     ts.moved = false;
     ts.rightClicked = false;
+    ts.wasTwoFinger = false;
 
+    const useLongPress = effectivePrefs.right_click_gesture !== "two_finger_tap";
     if (e.touches.length === 1) {
       if (touchMode === "touch") {
         const { x, y } = getTouchNorm(t, e.currentTarget);
         clientRef.current?.sendMouseMove(x, y);
-        ts.longPressTimer = window.setTimeout(() => {
-          if (!ts.moved) {
-            ts.rightClicked = true;
-            clientRef.current?.sendMouseButton("right", true, x, y);
-            clientRef.current?.sendMouseButton("right", false, x, y);
-          }
-        }, 480);
-      } else {
+        if (useLongPress) {
+          ts.longPressTimer = window.setTimeout(() => {
+            if (!ts.moved) {
+              ts.rightClicked = true;
+              clientRef.current?.sendMouseButton("right", true, x, y);
+              clientRef.current?.sendMouseButton("right", false, x, y);
+            }
+          }, 460);
+        }
+      } else if (useLongPress) {
         ts.longPressTimer = window.setTimeout(() => {
           if (!ts.moved) {
             ts.rightClicked = true;
@@ -543,7 +589,7 @@ export function RemoteViewer({
             clientRef.current?.sendMouseButton("right", true, cur.x, cur.y);
             clientRef.current?.sendMouseButton("right", false, cur.x, cur.y);
           }
-        }, 480);
+        }, 460);
       }
     }
   };
@@ -551,6 +597,43 @@ export function RemoteViewer({
   const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
     if (!permissions.allow_input || e.touches.length === 0) return;
     const ts = touchStateRef.current;
+
+    if (e.touches.length === 2) {
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      const midX = (t0.clientX + t1.clientX) / 2;
+      const midY = (t0.clientY + t1.clientY) / 2;
+
+      if (Math.abs(dist - ts.twoFingerStartDist) > 10) {
+        ts.twoFingerMoved = true;
+        if (ts.twoFingerStartDist > 10) {
+          const ratio = dist / ts.twoFingerStartDist;
+          updateZoom(ts.twoFingerStartZoom * ratio);
+        }
+      }
+
+      const moveDx = midX - ts.twoFingerMidX;
+      const moveDy = midY - ts.twoFingerMidY;
+      if (Math.hypot(moveDx, moveDy) > 6) {
+        ts.twoFingerMoved = true;
+        if (zoomRef.current > 1.05) {
+          const nextPan = {
+            x: Math.max(-600, Math.min(600, panRef.current.x + moveDx)),
+            y: Math.max(-600, Math.min(600, panRef.current.y + moveDy)),
+          };
+          panRef.current = nextPan;
+          setPan(nextPan);
+          ts.twoFingerMidX = midX;
+          ts.twoFingerMidY = midY;
+        } else if (Math.abs(ts.lastY - midY) > 12) {
+          clientRef.current?.sendMouseScroll(0, Math.sign(ts.lastY - midY) * 2);
+          ts.lastY = midY;
+        }
+      }
+      return;
+    }
+
     const t = e.touches[0];
     if (Math.hypot(t.clientX - ts.startX, t.clientY - ts.startY) > 7) {
       ts.moved = true;
@@ -559,26 +642,17 @@ export function RemoteViewer({
         ts.longPressTimer = null;
       }
     }
-    if (e.touches.length === 2) {
-      const dy = ts.lastY - t.clientY;
-      if (Math.abs(dy) > 12) {
-        clientRef.current?.sendMouseScroll(0, Math.sign(dy) * 2);
-        ts.lastY = t.clientY;
-      }
-      return;
-    }
 
     if (touchMode === "cursor") {
       const rect = e.currentTarget.getBoundingClientRect();
-      const dx = ((t.clientX - ts.lastX) / Math.max(1, rect.width)) * 1.35;
-      const dy = ((t.clientY - ts.lastY) / Math.max(1, rect.height)) * 1.35;
+      const dx = ((t.clientX - ts.lastX) / Math.max(1, rect.width)) * 1.45;
+      const dy = ((t.clientY - ts.lastY) / Math.max(1, rect.height)) * 1.45;
       ts.lastX = t.clientX;
       ts.lastY = t.clientY;
 
       const nx = Math.max(0, Math.min(1, virtualCursorRef.current.x + dx));
       const ny = Math.max(0, Math.min(1, virtualCursorRef.current.y + dy));
       virtualCursorRef.current = { x: nx, y: ny };
-      setVirtualCursor({ x: nx, y: ny });
 
       const now = performance.now();
       if (now - lastMoveSentRef.current < 16) return;
@@ -600,7 +674,26 @@ export function RemoteViewer({
       window.clearTimeout(ts.longPressTimer);
       ts.longPressTimer = null;
     }
-    if (!permissions.allow_input || ts.rightClicked || ts.moved) return;
+    if (!permissions.allow_input) return;
+
+    // Two-finger quick tap -> right click when configured
+    if (
+      ts.wasTwoFinger &&
+      e.touches.length === 0 &&
+      !ts.twoFingerMoved &&
+      effectivePrefs.right_click_gesture === "two_finger_tap"
+    ) {
+      ts.wasTwoFinger = false;
+      const pos =
+        touchMode === "cursor"
+          ? virtualCursorRef.current
+          : getTouchNorm(e.changedTouches[0], e.currentTarget);
+      clientRef.current?.sendMouseButton("right", true, pos.x, pos.y);
+      clientRef.current?.sendMouseButton("right", false, pos.x, pos.y);
+      return;
+    }
+
+    if (ts.wasTwoFinger || ts.rightClicked || ts.moved) return;
 
     if (touchMode === "cursor") {
       const cur = virtualCursorRef.current;
@@ -915,13 +1008,20 @@ export function RemoteViewer({
                 onClick={() => {
                   const next = touchMode === "touch" ? "cursor" : "touch";
                   setTouchMode(next);
+                  applyStreamConfig(fps, bitrateKbps, selectedDisplay, scale, next === "cursor");
+                  if (next === "cursor") {
+                    clientRef.current?.sendMouseMove(
+                      virtualCursorRef.current.x,
+                      virtualCursorRef.current.y
+                    );
+                  }
                   flashToast(
                     next === "cursor"
-                      ? "Modo Cursor (Trackpad): desliza para mover, toca para clic"
+                      ? "Modo Cursor real: desliza como touchpad, toca para clic"
                       : "Modo Táctil directo: toca directamente donde quieras hacer clic"
                   );
                 }}
-                title="Cambiar entre modo Táctil directo y Cursor (Trackpad)"
+                title="Cambiar entre modo Táctil directo y Cursor real de Windows"
               >
                 {touchMode === "cursor" ? (
                   <>
@@ -935,6 +1035,32 @@ export function RemoteViewer({
                   </>
                 )}
               </button>
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  style={{ padding: "5px 8px" }}
+                  onClick={() => updateZoom(zoom - 0.5)}
+                  title="Alejar zoom"
+                >
+                  −
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  style={{ padding: "5px 7px", fontFamily: "JetBrains Mono, monospace", fontSize: 11 }}
+                  onClick={() => updateZoom(1.0)}
+                  title="Restablecer zoom a 100%"
+                >
+                  {Math.round(zoom * 100)}%
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  style={{ padding: "5px 8px" }}
+                  onClick={() => updateZoom(zoom + 0.5)}
+                  title="Acercar zoom"
+                >
+                  +
+                </button>
+              </div>
               <button
                 className={`btn btn-sm ${showSpecialKeys ? "btn-primary" : "btn-secondary"}`}
                 onClick={() => setShowSpecialKeys((s) => !s)}
@@ -1132,7 +1258,13 @@ export function RemoteViewer({
         onDragOver={(e) => e.preventDefault()}
         onDrop={handleDrop}
       >
-        <div className="viewer-canvas-wrap">
+        <div
+          className="viewer-canvas-wrap"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "center center",
+          }}
+        >
           <canvas
             ref={canvasRef}
             className="viewer-canvas"
@@ -1146,15 +1278,6 @@ export function RemoteViewer({
             onTouchEnd={handleTouchEnd}
             onContextMenu={(e) => e.preventDefault()}
           />
-          {isTouchDevice && touchMode === "cursor" && (
-            <div
-              className="virtual-cursor"
-              style={{
-                left: `${virtualCursor.x * 100}%`,
-                top: `${virtualCursor.y * 100}%`,
-              }}
-            />
-          )}
         </div>
 
         {remoteCopiedFiles.length > 0 && permissions.allow_file_transfer && (
@@ -1227,6 +1350,16 @@ export function RemoteViewer({
               onClick={() => mobileInputRef.current?.focus()}
             >
               ⌨ Teclado
+            </button>
+            <button
+              className="skey-btn"
+              onClick={() => {
+                const cur = virtualCursorRef.current;
+                clientRef.current?.sendMouseButton("right", true, cur.x, cur.y);
+                clientRef.current?.sendMouseButton("right", false, cur.x, cur.y);
+              }}
+            >
+              Clic Der.
             </button>
             <button
               className={`skey-btn ${stickyMods.ctrl ? "active" : ""}`}

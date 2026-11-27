@@ -246,9 +246,9 @@ export async function relaunchWithUiMode(
 
 export async function getAppVersion(): Promise<string> {
   if (isTauriEnv()) {
-    return invoke<string>("get_app_version").catch(() => "0.1.14");
+    return invoke<string>("get_app_version").catch(() => "0.1.15");
   }
-  return "0.1.14";
+  return "0.1.15";
 }
 
 export async function hasDesktopShortcut(): Promise<boolean> {

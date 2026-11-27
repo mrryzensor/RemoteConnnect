@@ -152,6 +152,8 @@ pub enum SessionMessage {
         scale: f32,
         #[serde(default)]
         bitrate_kbps: u32,
+        #[serde(default)]
+        show_cursor: bool,
     },
 
     /// Viewer requests an immediate H.264 IDR keyframe.

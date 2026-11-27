@@ -26,10 +26,12 @@ import {
 
 interface Props {
   config: AppConfig;
+  appVersion: string;
   theme: "dark" | "light";
   autostartEnabled: boolean;
   onToggleTheme: () => void;
   onToggleAutostart: (next: boolean) => Promise<void>;
+  onCheckUpdates: () => Promise<string>;
   onSavePreferences: (prefs: UserPreferences) => Promise<void>;
   onSaveServer: (
     serverUrl: string,
@@ -43,10 +45,12 @@ type TabId = "general" | "media" | "server";
 
 export function SettingsModal({
   config,
+  appVersion,
   theme,
   autostartEnabled,
   onToggleTheme,
   onToggleAutostart,
+  onCheckUpdates,
   onSavePreferences,
   onSaveServer,
   onClose,
@@ -64,6 +68,8 @@ export function SettingsModal({
   const [saving, setSaving] = useState(false);
   const [shortcutExists, setShortcutExists] = useState(true);
   const [creatingShortcut, setCreatingShortcut] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (isTauriEnv()) {
@@ -287,6 +293,40 @@ export function SettingsModal({
                 </span>
               </label>
             </div>
+
+            <div className="card" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div className="toggle-row">
+                <div>
+                  <strong>Versión instalada: v{appVersion}</strong>
+                  <div className="toggle-desc">
+                    Actualizaciones automáticas activas desde GitHub Releases
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  disabled={checkingUpdate}
+                  onClick={async () => {
+                    setCheckingUpdate(true);
+                    setUpdateMessage(null);
+                    try {
+                      const msg = await onCheckUpdates();
+                      setUpdateMessage(msg);
+                    } finally {
+                      setCheckingUpdate(false);
+                    }
+                  }}
+                >
+                  <RotateCcw size={13} />
+                  {checkingUpdate ? "Buscando..." : "Buscar actualizaciones"}
+                </button>
+              </div>
+              {updateMessage && (
+                <div style={{ fontSize: 12, color: "var(--accent)", fontWeight: 500 }}>
+                  {updateMessage}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -424,6 +464,22 @@ export function SettingsModal({
                   <span className="switch-slider" />
                 </span>
               </label>
+
+              <div className="field">
+                <label>Gesto de clic derecho en Android / táctil</label>
+                <select
+                  value={prefs.right_click_gesture}
+                  onChange={(e) =>
+                    setPrefs((p) => ({
+                      ...p,
+                      right_click_gesture: e.target.value as "long_press" | "two_finger_tap",
+                    }))
+                  }
+                >
+                  <option value="long_press">Mantener presionado (predeterminado)</option>
+                  <option value="two_finger_tap">Toque rápido con 2 dedos</option>
+                </select>
+              </div>
             </div>
           </div>
         )}

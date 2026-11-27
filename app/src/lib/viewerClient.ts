@@ -897,7 +897,8 @@ export class RemoteViewerClient {
     fps: number,
     bitrateKbps: number,
     displayIndex: number,
-    scale: number
+    scale: number,
+    showCursor = false
   ) {
     void this.sendEncrypted({
       kind: "stream_config",
@@ -906,6 +907,7 @@ export class RemoteViewerClient {
       bitrate_kbps: bitrateKbps,
       display_index: displayIndex,
       scale,
+      show_cursor: showCursor,
     });
   }
 

@@ -138,6 +138,7 @@ function MainApp() {
 
   const [toast, setToast] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string>("0.1.15");
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -186,6 +187,8 @@ function MainApp() {
       if (isTauriEnv()) {
         const auto = await getAutostart().catch(() => false);
         setAutostartEnabled(auto);
+        const ver = await getAppVersion().catch(() => "0.1.15");
+        setAppVersion(ver);
       }
     })();
 
@@ -240,16 +243,15 @@ function MainApp() {
     void setViewerMode(Boolean(activeViewer));
   }, [activeViewer]);
 
-  // Silent automatic updater: checks GitHub Releases on launch & hourly, updates without prompting
-  useEffect(() => {
-    if (!isTauriEnv()) return;
-
+  const checkAndAutoUpdate = async (manual = false): Promise<string> => {
+    if (!isTauriEnv()) {
+      return "Las actualizaciones automáticas solo aplican en la app de escritorio/Android.";
+    }
     const parseSemver = (v: string): [number, number, number] => {
       const clean = v.replace(/^v/i, "").split("-")[0];
       const parts = clean.split(".").map((n) => parseInt(n, 10) || 0);
       return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
     };
-
     const isNewer = (latest: string, current: string): boolean => {
       const a = parseSemver(latest);
       const b = parseSemver(current);
@@ -258,49 +260,63 @@ function MainApp() {
       return a[2] > b[2];
     };
 
-    const checkAndAutoUpdate = async () => {
-      try {
-        const currentVer = await getAppVersion();
-        const res = await fetch(
-          "https://api.github.com/repos/mrryzensor/RemoteConnnect/releases/latest",
-          { headers: { Accept: "application/vnd.github+json" }, cache: "no-store" }
-        );
-        if (!res.ok) return;
-        const rel = (await res.json()) as {
-          tag_name?: string;
-          assets?: Array<{ name: string; browser_download_url: string }>;
-        };
-        const tag = rel.tag_name;
-        if (!tag || !isNewer(tag, currentVer)) return;
-
-        const assets = rel.assets ?? [];
-        const isAndroid = /Android/i.test(navigator.userAgent);
-
-        if (isAndroid) {
-          const apk = assets.find((a) => a.name.toLowerCase().endsWith(".apk"));
-          if (!apk) return;
-          setUpdatingStatus(`Actualizando a ${tag}...`);
-          window.location.href = apk.browser_download_url;
-          window.setTimeout(() => setUpdatingStatus(null), 8000);
-          return;
-        }
-
-        const portable = assets.find(
-          (a) =>
-            a.name.toLowerCase().includes("portable") &&
-            a.name.toLowerCase().endsWith(".exe")
-        );
-        if (!portable) return;
-
-        setUpdatingStatus(`Actualizando a ${tag}...`);
-        await installWindowsUpdate(portable.browser_download_url);
-      } catch {
-        setUpdatingStatus(null);
+    try {
+      const currentVer = await getAppVersion();
+      setAppVersion(currentVer);
+      const res = await fetch(
+        "https://api.github.com/repos/mrryzensor/RemoteConnnect/releases/latest",
+        { headers: { Accept: "application/vnd.github+json" }, cache: "no-store" }
+      );
+      if (!res.ok) {
+        return `No se pudo consultar GitHub (HTTP ${res.status})`;
       }
-    };
+      const rel = (await res.json()) as {
+        tag_name?: string;
+        assets?: Array<{ name: string; browser_download_url: string }>;
+      };
+      const tag = rel.tag_name;
+      if (!tag) return "No se encontró ninguna versión publicada.";
+      if (!isNewer(tag, currentVer)) {
+        return `✓ Ya tienes la última versión (v${currentVer})`;
+      }
 
-    const initialTimer = window.setTimeout(() => void checkAndAutoUpdate(), 2500);
-    const periodicTimer = window.setInterval(() => void checkAndAutoUpdate(), 60 * 60 * 1000);
+      const assets = rel.assets ?? [];
+      const isAndroid = /Android/i.test(navigator.userAgent);
+
+      if (isAndroid) {
+        const apk = assets.find((a) => a.name.toLowerCase().endsWith(".apk"));
+        if (!apk) return `Nueva versión ${tag} encontrada, pero aún se está compilando el APK.`;
+        setUpdatingStatus(`Actualizando a ${tag}...`);
+        window.location.href = apk.browser_download_url;
+        window.setTimeout(() => setUpdatingStatus(null), 8000);
+        return `Descargando ${tag}...`;
+      }
+
+      const portable = assets.find(
+        (a) =>
+          a.name.toLowerCase().includes("portable") &&
+          a.name.toLowerCase().endsWith(".exe")
+      );
+      if (!portable) {
+        return `Nueva versión ${tag} encontrada, pero aún se está compilando el ejecutable.`;
+      }
+
+      setUpdatingStatus(`Actualizando a ${tag}...`);
+      await installWindowsUpdate(portable.browser_download_url);
+      return `Actualizando a ${tag}...`;
+    } catch (err) {
+      setUpdatingStatus(null);
+      return manual
+        ? `Error al buscar actualizaciones: ${String(err)}`
+        : "";
+    }
+  };
+
+  // Silent automatic updater: checks GitHub Releases on launch & hourly, updates without prompting
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    const initialTimer = window.setTimeout(() => void checkAndAutoUpdate(false), 2500);
+    const periodicTimer = window.setInterval(() => void checkAndAutoUpdate(false), 60 * 60 * 1000);
     return () => {
       window.clearTimeout(initialTimer);
       window.clearInterval(periodicTimer);
@@ -505,7 +521,7 @@ function MainApp() {
             </div>
             <div>
               <h1>RemoteConnect</h1>
-              <div className="brand-sub">Rust E2E Desktop</div>
+              <div className="brand-sub">Rust E2E • v{appVersion}</div>
             </div>
           </div>
           <div className="brand-actions">
@@ -989,9 +1005,11 @@ function MainApp() {
       {showSettingsModal && (
         <SettingsModal
           config={config}
+          appVersion={appVersion}
           theme={theme}
           autostartEnabled={autostartEnabled}
           onToggleTheme={toggleTheme}
+          onCheckUpdates={() => checkAndAutoUpdate(true)}
           onToggleAutostart={async (next) => {
             try {
               const res = await setAutostart(next);

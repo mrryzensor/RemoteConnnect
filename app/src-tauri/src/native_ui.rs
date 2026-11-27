@@ -354,9 +354,12 @@ pub fn run_native_fallback(cfg: crate::AppConfig, start_in_background: bool) {
                                     .strong(),
                             );
                             ui.label(
-                                RichText::new("Modo Nativo GPU • Sin WebView2")
-                                    .size(11.0)
-                                    .color(muted),
+                                RichText::new(format!(
+                                    "Modo Nativo GPU • v{}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .size(11.0)
+                                .color(muted),
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

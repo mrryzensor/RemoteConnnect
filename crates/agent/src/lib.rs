@@ -219,6 +219,7 @@ struct StreamSettings {
     bitrate_kbps: AtomicU32,
     display_index: AtomicUsize,
     scale_x100: AtomicU8,
+    show_cursor: AtomicBool,
     force_keyframe: AtomicBool,
     active: Arc<AtomicBool>,
     cached_bounds: Mutex<DisplayBounds>,
@@ -233,6 +234,7 @@ impl StreamSettings {
             bitrate_kbps: AtomicU32::new(2500),
             display_index: AtomicUsize::new(0),
             scale_x100: AtomicU8::new(100),
+            show_cursor: AtomicBool::new(false),
             force_keyframe: AtomicBool::new(true),
             active: Arc::new(AtomicBool::new(true)),
             cached_bounds: Mutex::new(initial_bounds),
@@ -741,6 +743,7 @@ fn start_session(
                 let bitrate_kbps = settings.bitrate_kbps.load(Ordering::Relaxed);
                 let display_idx = settings.display_index.load(Ordering::Relaxed);
                 let scale = (settings.scale_x100.load(Ordering::Relaxed) as f32) / 100.0;
+                let show_cursor = settings.show_cursor.load(Ordering::Relaxed);
                 let force_kf = settings.force_keyframe.swap(false, Ordering::AcqRel);
                 let ts_ms = session_start.elapsed().as_millis() as u32;
 
@@ -750,6 +753,7 @@ fn start_session(
                     bitrate_kbps,
                     fps,
                     force_kf,
+                    show_cursor,
                     ts_ms,
                 ) {
                     Ok(CaptureOutcome::Encoded(encoded)) => {
@@ -888,12 +892,15 @@ fn handle_session_message(
             display_index,
             scale,
             bitrate_kbps,
+            show_cursor,
         } => {
             let prev_disp = sess.settings.display_index.swap(display_index, Ordering::Relaxed);
             if prev_disp != display_index {
                 sess.settings.refresh_bounds(display_index);
                 sess.settings.force_keyframe.store(true, Ordering::Release);
             }
+            sess.settings.show_cursor.store(show_cursor, Ordering::Relaxed);
+            sess.settings.wake_capture();
             sess.settings.fps.store(fps.clamp(5, 60), Ordering::Relaxed);
             let target_bitrate = if bitrate_kbps > 0 {
                 bitrate_kbps
@@ -936,6 +943,9 @@ fn handle_session_message(
                 y,
                 bounds: sess.settings.bounds(),
             });
+            if sess.settings.show_cursor.load(Ordering::Relaxed) {
+                sess.settings.wake_capture();
+            }
         }
 
         SessionMessage::MouseButton {

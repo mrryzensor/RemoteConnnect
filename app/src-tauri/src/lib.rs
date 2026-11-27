@@ -60,6 +60,10 @@ fn default_ui_mode() -> String {
     "auto".into()
 }
 
+fn default_right_click_gesture() -> String {
+    "long_press".into()
+}
+
 pub fn default_recordings_dir() -> String {
     if let Some(ud) = UserDirs::new() {
         if let Some(vid) = ud.video_dir() {
@@ -94,6 +98,8 @@ pub struct UserPreferences {
     pub prefer_p2p: bool,
     #[serde(default = "default_ui_mode")]
     pub ui_mode: String,
+    #[serde(default = "default_right_click_gesture")]
+    pub right_click_gesture: String,
 }
 
 impl Default for UserPreferences {
@@ -108,6 +114,7 @@ impl Default for UserPreferences {
             mute_audio_on_connect: false,
             prefer_p2p: true,
             ui_mode: default_ui_mode(),
+            right_click_gesture: default_right_click_gesture(),
         }
     }
 }
