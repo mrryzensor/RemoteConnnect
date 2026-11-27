@@ -148,6 +148,7 @@ impl H264ScreenCapturer {
             self.enc_height = height;
             self.enc_bitrate_bps = bitrate_bps;
             self.enc_fps = fps;
+            self.yuv_buf = YUVBuffer::new(width as usize, height as usize);
             self.frames_since_keyframe = 0;
         }
         Ok(())
@@ -203,7 +204,7 @@ impl H264ScreenCapturer {
         let bitrate_bps = bitrate_kbps.clamp(400, 12_000) * 1000;
         self.ensure_encoder(dst_w, dst_h, bitrate_bps, (fps.clamp(5, 60)) as f32)?;
 
-        // Convert RGBA -> YUV420p (uses OpenH264's SIMD-accelerated converter)
+        // Convert RGBA -> YUV420p
         let rgba_source = RgbaSliceU8::new(&self.prev_rgba, (dst_w as usize, dst_h as usize));
         self.yuv_buf.read_rgb(rgba_source);
 
@@ -303,6 +304,20 @@ mod tests {
         assert_eq!(&bytes[0..4], &[0, 0, 0, 1]);
         // First NALU on IDR should be SPS (type 7: 0x67 & 0x1f == 7)
         assert_eq!(bytes[4] & 0x1f, 7);
+    }
+
+    #[test]
+    fn capturer_resizes_yuv_buffer_and_encodes_1080p() {
+        let mut cap = H264ScreenCapturer::new(0);
+        cap.ensure_encoder(1920, 1080, 2_500_000, 30.0).unwrap();
+        let rgba = vec![90u8; 1920 * 1080 * 4];
+        cap.yuv_buf.read_rgb(RgbaSliceU8::new(&rgba, (1920, 1080)));
+        let enc = cap.encoder.as_mut().unwrap();
+        enc.force_intra_frame();
+        let bs = enc.encode(&cap.yuv_buf).unwrap();
+        let bytes = bs.to_vec();
+        assert!(!bytes.is_empty());
+        assert_eq!(&bytes[0..4], &[0, 0, 0, 1]);
     }
 
     #[test]
