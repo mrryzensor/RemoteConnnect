@@ -529,6 +529,80 @@ fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
     });
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) mod shortcut {
+    use std::os::windows::process::CommandExt;
+    use std::path::PathBuf;
+    use directories::UserDirs;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    pub fn desktop_shortcut_path() -> Option<PathBuf> {
+        UserDirs::new()
+            .and_then(|u| u.desktop_dir().map(|d| d.join("RemoteConnect.lnk")))
+    }
+
+    pub fn exists() -> bool {
+        desktop_shortcut_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    pub fn create() -> Result<String, String> {
+        let lnk = desktop_shortcut_path()
+            .ok_or_else(|| "No se pudo encontrar la carpeta del Escritorio".to_string())?;
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("No se encontró el ejecutable: {}", e))?;
+        let work_dir = exe
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let lnk_str = lnk.to_string_lossy().replace('\'', "''");
+        let exe_str = exe.to_string_lossy().replace('\'', "''");
+        let dir_str = work_dir.replace('\'', "''");
+
+        let ps = format!(
+            "$ws = New-Object -ComObject WScript.Shell; \
+             $s = $ws.CreateShortcut('{lnk_str}'); \
+             $s.TargetPath = '{exe_str}'; \
+             $s.WorkingDirectory = '{dir_str}'; \
+             $s.IconLocation = '{exe_str},0'; \
+             $s.Description = 'RemoteConnect — Escritorio Remoto E2E'; \
+             $s.Save()"
+        );
+
+        let status = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| format!("Error creando acceso directo: {}", e))?;
+
+        if !status.success() {
+            return Err("No se pudo crear el acceso directo en el Escritorio".into());
+        }
+        Ok(lnk.to_string_lossy().to_string())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) mod shortcut {
+    pub fn exists() -> bool {
+        true
+    }
+    pub fn create() -> Result<String, String> {
+        Err("Solo disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
+fn has_desktop_shortcut() -> bool {
+    shortcut::exists()
+}
+
+#[tauri::command]
+fn create_desktop_shortcut() -> Result<String, String> {
+    shortcut::create()
+}
+
 #[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1035,6 +1109,8 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             get_app_version,
+            has_desktop_shortcut,
+            create_desktop_shortcut,
             install_windows_update,
             get_config,
             get_agent_status,

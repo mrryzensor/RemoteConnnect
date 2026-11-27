@@ -14,7 +14,7 @@ pub fn run_native_fallback(cfg: crate::AppConfig, start_in_background: bool) {
     use remoteconnect_protocol::{generate_pin, normalize_device_id, SessionPermissions};
     use tokio::sync::mpsc;
 
-    use crate::{autostart, default_recordings_dir, AppConfig, SavedDevice, UserPreferences};
+    use crate::{autostart, default_recordings_dir, shortcut, AppConfig, SavedDevice, UserPreferences};
 
     #[derive(Clone)]
     struct ActiveSession {
@@ -864,6 +864,24 @@ pub fn run_native_fallback(cfg: crate::AppConfig, start_in_background: bool) {
                                     "Mostrar widget flotante al recibir conexión",
                                 );
                                 ui.checkbox(&mut self.dark_mode, "Tema oscuro");
+                                ui.add_space(6.0);
+                                if !shortcut::exists() {
+                                    if ui
+                                        .button("➕ Crear acceso directo en el Escritorio")
+                                        .clicked()
+                                    {
+                                        match shortcut::create() {
+                                            Ok(_) => self.notify("Acceso directo creado en el Escritorio"),
+                                            Err(e) => self.notify(e),
+                                        }
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new("✓ Acceso directo en el Escritorio ya creado")
+                                            .size(11.5)
+                                            .color(success),
+                                    );
+                                }
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     ui.label("Modo de interfaz:");

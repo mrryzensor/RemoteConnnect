@@ -246,9 +246,23 @@ export async function relaunchWithUiMode(
 
 export async function getAppVersion(): Promise<string> {
   if (isTauriEnv()) {
-    return invoke<string>("get_app_version").catch(() => "0.1.13");
+    return invoke<string>("get_app_version").catch(() => "0.1.14");
   }
-  return "0.1.13";
+  return "0.1.14";
+}
+
+export async function hasDesktopShortcut(): Promise<boolean> {
+  if (isTauriEnv()) {
+    return invoke<boolean>("has_desktop_shortcut").catch(() => true);
+  }
+  return true;
+}
+
+export async function createDesktopShortcut(): Promise<string> {
+  if (isTauriEnv()) {
+    return invoke<string>("create_desktop_shortcut");
+  }
+  throw new Error("Solo disponible en escritorio");
 }
 
 export async function installWindowsUpdate(downloadUrl: string): Promise<void> {

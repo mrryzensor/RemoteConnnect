@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
+  Check,
+  ExternalLink,
   FolderOpen,
   Monitor,
   RotateCcw,
@@ -14,7 +16,13 @@ import {
   type AppConfig,
   type UserPreferences,
 } from "../types";
-import { isTauriEnv, openFolder, relaunchWithUiMode } from "../lib/tauriBridge";
+import {
+  createDesktopShortcut,
+  hasDesktopShortcut,
+  isTauriEnv,
+  openFolder,
+  relaunchWithUiMode,
+} from "../lib/tauriBridge";
 
 interface Props {
   config: AppConfig;
@@ -54,6 +62,14 @@ export function SettingsModal({
   const [deviceName, setDeviceName] = useState(config.device_name);
   const [authToken, setAuthToken] = useState(config.auth_token ?? "");
   const [saving, setSaving] = useState(false);
+  const [shortcutExists, setShortcutExists] = useState(true);
+  const [creatingShortcut, setCreatingShortcut] = useState(false);
+
+  useEffect(() => {
+    if (isTauriEnv()) {
+      void hasDesktopShortcut().then(setShortcutExists);
+    }
+  }, []);
 
   const handleSave = async () => {
     setSaving(true);
@@ -206,6 +222,50 @@ export function SettingsModal({
                     </div>
                   </div>
                 </div>
+
+                {!shortcutExists ? (
+                  <div className="card">
+                    <div className="toggle-row">
+                      <div>
+                        <strong>Acceso directo en el Escritorio</strong>
+                        <div className="toggle-desc">
+                          No se detectó acceso directo en tu Escritorio; créalo en un clic
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={creatingShortcut}
+                        onClick={async () => {
+                          setCreatingShortcut(true);
+                          try {
+                            await createDesktopShortcut();
+                            setShortcutExists(true);
+                          } finally {
+                            setCreatingShortcut(false);
+                          }
+                        }}
+                      >
+                        <ExternalLink size={13} />
+                        {creatingShortcut ? "Creando..." : "Crear acceso directo"}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      fontSize: 12,
+                      color: "var(--success-text)",
+                      padding: "0 4px",
+                    }}
+                  >
+                    <Check size={14} />
+                    Acceso directo en el Escritorio ya configurado
+                  </div>
+                )}
               </>
             )}
 
