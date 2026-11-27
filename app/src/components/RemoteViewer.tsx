@@ -145,7 +145,7 @@ export function RemoteViewer({
           canvas.width = w;
           canvas.height = h;
         }
-        const ctx = canvas.getContext("2d");
+        const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
         if (ctx) {
           ctx.drawImage(frame, 0, 0, w, h);
         }
@@ -162,7 +162,7 @@ export function RemoteViewer({
           canvas.width = width;
           canvas.height = height;
         }
-        const ctx = canvas.getContext("2d");
+        const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
         if (ctx) {
           ctx.drawImage(bitmap, 0, 0);
         }
@@ -473,12 +473,12 @@ export function RemoteViewer({
 
   const toggleFullscreen = async () => {
     const next = !isFullscreen;
+    setShowSettings(false);
+    setToolbarRevealed(false);
     if (isTauriEnv()) {
       try {
         await getCurrentWindow().setFullscreen(next);
         setIsFullscreen(next);
-        setToolbarRevealed(false);
-        if (!next) setShowSettings(false);
       } catch {
         // fallback to DOM fullscreen
         if (next) {
@@ -506,12 +506,12 @@ export function RemoteViewer({
   };
 
   const scheduleHideToolbar = () => {
-    if (showSettings) return;
     if (hideToolbarTimerRef.current !== null) {
       window.clearTimeout(hideToolbarTimerRef.current);
     }
     hideToolbarTimerRef.current = window.setTimeout(() => {
       setToolbarRevealed(false);
+      setShowSettings(false);
     }, 450);
   };
 
@@ -697,8 +697,16 @@ export function RemoteViewer({
         </div>
       </div>
 
-      {showSettings && (
-        <div className="viewer-settings-bar">
+      {showSettings && (!isFullscreen || toolbarRevealed) && (
+        <div
+          className="viewer-settings-bar"
+          onMouseEnter={() => {
+            if (isFullscreen) revealToolbar();
+          }}
+          onMouseLeave={() => {
+            if (isFullscreen) scheduleHideToolbar();
+          }}
+        >
           <div style={{ display: "flex", gap: 6 }}>
             <button
               className="btn btn-secondary btn-sm"

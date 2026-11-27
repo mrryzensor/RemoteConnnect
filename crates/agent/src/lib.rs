@@ -17,7 +17,7 @@ use remoteconnect_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 
 use crate::audio::spawn_audio_capture;
@@ -274,7 +274,8 @@ async fn run_agent_loop(
             server_url: config.server_url.clone(),
         });
 
-        match connect_async(&config.server_url).await {
+        // disable_nagle = true (TCP_NODELAY) for minimum input & frame latency
+        match connect_async_with_config(&config.server_url, None, true).await {
             Ok((ws_stream, _)) => {
                 info!("Connected to server {}", config.server_url);
                 let should_stop =
@@ -335,8 +336,8 @@ async fn handle_connection(
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     // High-priority control/input/audio channel
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
-    // Bounded video channel (capacity 2) to eliminate bufferbloat & queuing latency
-    let (video_tx, mut video_rx) = mpsc::channel::<WsMessage>(2);
+    // Bounded video channel (capacity 1) to eliminate bufferbloat & queuing latency
+    let (video_tx, mut video_rx) = mpsc::channel::<WsMessage>(1);
 
     let writer = tokio::spawn(async move {
         loop {
