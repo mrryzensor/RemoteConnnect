@@ -1,9 +1,15 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Result};
 use openh264::encoder::{Encoder, EncoderConfig, FrameType, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
-use openh264::OpenH264API;
+use openh264::{OpenH264API, Timestamp};
 use remoteconnect_protocol::DisplayInfo;
+use tracing::{info, warn};
 use xcap::Monitor;
+
+#[cfg(target_os = "windows")]
+use crate::dxgi::{DxgiCaptureStatus, DxgiCapturer};
 
 /// List all available physical monitors.
 pub fn list_displays() -> Vec<DisplayInfo> {
@@ -94,21 +100,38 @@ impl FastYuv420 {
         }
     }
 
-    /// Blazing-fast 2x2-block integer BT.601 RGBA -> YUV420p conversion with inline scaling.
-    /// Eliminates intermediate resize buffer copy and per-pixel trait calls (~2-3ms for 1080p!).
+    #[inline]
     fn fill_from_rgba(&mut self, src: &[u8], src_w: usize, src_h: usize) {
+        self.fill_from_pixels::<false>(src, src_w, src_h, src_w * 4);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[inline]
+    fn fill_from_bgra(&mut self, src: &[u8], src_w: usize, src_h: usize, src_stride: usize) {
+        self.fill_from_pixels::<true>(src, src_w, src_h, src_stride);
+    }
+
+    /// Blazing-fast 2x2-block integer BT.601 RGBA/BGRA -> YUV420p conversion with inline scaling.
+    /// Eliminates intermediate resize/swizzle buffer copies (~2ms for 1080p).
+    fn fill_from_pixels<const IS_BGRA: bool>(
+        &mut self,
+        src: &[u8],
+        src_w: usize,
+        src_h: usize,
+        src_stride: usize,
+    ) {
         let dst_w = self.width;
         let dst_h = self.height;
-        let src_stride = src_w * 4;
         let uv_w = dst_w / 2;
+        let (r_off, g_off, b_off) = if IS_BGRA { (2, 1, 0) } else { (0, 1, 2) };
 
         if dst_w == src_w && dst_h == src_h {
             // Fast 1:1 path (no scaling)
             for by in 0..(dst_h / 2) {
                 let y0 = by * 2;
                 let y1 = y0 + 1;
-                let srow0 = &src[y0 * src_stride..(y0 + 1) * src_stride];
-                let srow1 = &src[y1 * src_stride..(y1 + 1) * src_stride];
+                let srow0 = &src[y0 * src_stride..y0 * src_stride + src_w * 4];
+                let srow1 = &src[y1 * src_stride..y1 * src_stride + src_w * 4];
                 let (yrow0, yrow1) = self.y[y0 * dst_w..(y1 + 1) * dst_w].split_at_mut(dst_w);
                 let urow = &mut self.u[by * uv_w..(by + 1) * uv_w];
                 let vrow = &mut self.v[by * uv_w..(by + 1) * uv_w];
@@ -118,21 +141,21 @@ impl FastYuv420 {
                     let p00 = x0 * 4;
                     let p01 = p00 + 4;
 
-                    let r00 = srow0[p00] as i32;
-                    let g00 = srow0[p00 + 1] as i32;
-                    let b00 = srow0[p00 + 2] as i32;
+                    let r00 = srow0[p00 + r_off] as i32;
+                    let g00 = srow0[p00 + g_off] as i32;
+                    let b00 = srow0[p00 + b_off] as i32;
 
-                    let r01 = srow0[p01] as i32;
-                    let g01 = srow0[p01 + 1] as i32;
-                    let b01 = srow0[p01 + 2] as i32;
+                    let r01 = srow0[p01 + r_off] as i32;
+                    let g01 = srow0[p01 + g_off] as i32;
+                    let b01 = srow0[p01 + b_off] as i32;
 
-                    let r10 = srow1[p00] as i32;
-                    let g10 = srow1[p00 + 1] as i32;
-                    let b10 = srow1[p00 + 2] as i32;
+                    let r10 = srow1[p00 + r_off] as i32;
+                    let g10 = srow1[p00 + g_off] as i32;
+                    let b10 = srow1[p00 + b_off] as i32;
 
-                    let r11 = srow1[p01] as i32;
-                    let g11 = srow1[p01 + 1] as i32;
-                    let b11 = srow1[p01 + 2] as i32;
+                    let r11 = srow1[p01 + r_off] as i32;
+                    let g11 = srow1[p01 + g_off] as i32;
+                    let b11 = srow1[p01 + b_off] as i32;
 
                     yrow0[x0] = (((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16) as u8;
                     yrow0[x0 + 1] = (((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16) as u8;
@@ -157,8 +180,8 @@ impl FastYuv420 {
                 let y1 = y0 + 1;
                 let sy0 = (((y0 as u64) * y_ratio) >> 16) as usize;
                 let sy1 = (((y1 as u64) * y_ratio) >> 16) as usize;
-                let srow0 = &src[sy0 * src_stride..(sy0 + 1) * src_stride];
-                let srow1 = &src[sy1 * src_stride..(sy1 + 1) * src_stride];
+                let srow0 = &src[sy0 * src_stride..sy0 * src_stride + src_w * 4];
+                let srow1 = &src[sy1 * src_stride..sy1 * src_stride + src_w * 4];
                 let (yrow0, yrow1) = self.y[y0 * dst_w..(y1 + 1) * dst_w].split_at_mut(dst_w);
                 let urow = &mut self.u[by * uv_w..(by + 1) * uv_w];
                 let vrow = &mut self.v[by * uv_w..(by + 1) * uv_w];
@@ -168,21 +191,21 @@ impl FastYuv420 {
                     let sx0 = ((((x0 as u64) * x_ratio) >> 16) as usize) * 4;
                     let sx1 = (((((x0 + 1) as u64) * x_ratio) >> 16) as usize) * 4;
 
-                    let r00 = srow0[sx0] as i32;
-                    let g00 = srow0[sx0 + 1] as i32;
-                    let b00 = srow0[sx0 + 2] as i32;
+                    let r00 = srow0[sx0 + r_off] as i32;
+                    let g00 = srow0[sx0 + g_off] as i32;
+                    let b00 = srow0[sx0 + b_off] as i32;
 
-                    let r01 = srow0[sx1] as i32;
-                    let g01 = srow0[sx1 + 1] as i32;
-                    let b01 = srow0[sx1 + 2] as i32;
+                    let r01 = srow0[sx1 + r_off] as i32;
+                    let g01 = srow0[sx1 + g_off] as i32;
+                    let b01 = srow0[sx1 + b_off] as i32;
 
-                    let r10 = srow1[sx0] as i32;
-                    let g10 = srow1[sx0 + 1] as i32;
-                    let b10 = srow1[sx0 + 2] as i32;
+                    let r10 = srow1[sx0 + r_off] as i32;
+                    let g10 = srow1[sx0 + g_off] as i32;
+                    let b10 = srow1[sx0 + b_off] as i32;
 
-                    let r11 = srow1[sx1] as i32;
-                    let g11 = srow1[sx1 + 1] as i32;
-                    let b11 = srow1[sx1 + 2] as i32;
+                    let r11 = srow1[sx1 + r_off] as i32;
+                    let g11 = srow1[sx1 + g_off] as i32;
+                    let b11 = srow1[sx1 + b_off] as i32;
 
                     yrow0[x0] = (((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16) as u8;
                     yrow0[x0 + 1] = (((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16) as u8;
@@ -231,8 +254,19 @@ pub struct EncodedVideoFrame {
     pub h264_annex_b: Vec<u8>,
 }
 
-/// Stateful, ultra-low-latency screen capture + OpenH264 encoder.
+/// Result of one capture iteration, indicating whether the capturer already waited on DWM.
+pub enum CaptureOutcome {
+    Encoded(EncodedVideoFrame),
+    Unchanged { waited_event: bool },
+}
+
+/// Stateful, ultra-low-latency screen capture (DXGI Desktop Duplication on Windows with
+/// automatic `xcap` fallback) + multi-threaded OpenH264 encoder.
 pub struct H264ScreenCapturer {
+    #[cfg(target_os = "windows")]
+    dxgi: Option<DxgiCapturer>,
+    #[cfg(target_os = "windows")]
+    dxgi_retry_after: Option<Instant>,
     monitor: Option<Monitor>,
     cached_display_idx: usize,
     encoder: Option<Encoder>,
@@ -248,10 +282,26 @@ pub struct H264ScreenCapturer {
 
 impl H264ScreenCapturer {
     pub fn new(display_index: usize) -> Self {
+        #[cfg(target_os = "windows")]
+        let dxgi = match DxgiCapturer::new(display_index) {
+            Ok(cap) => {
+                info!("DXGI Desktop Duplication initialized for display {}", display_index);
+                Some(cap)
+            }
+            Err(e) => {
+                warn!("DXGI init failed (using GDI fallback): {}", e);
+                None
+            }
+        };
+
         let monitor = Monitor::all()
             .ok()
             .and_then(|ms| ms.into_iter().nth(display_index));
         Self {
+            #[cfg(target_os = "windows")]
+            dxgi,
+            #[cfg(target_os = "windows")]
+            dxgi_retry_after: None,
             monitor,
             cached_display_idx: display_index,
             encoder: None,
@@ -291,11 +341,16 @@ impl H264ScreenCapturer {
             || (self.enc_fps - fps).abs() > 5.0;
 
         if needs_reinit {
+            let threads = std::thread::available_parallelism()
+                .map(|n| (n.get() as u16).clamp(2, 4))
+                .unwrap_or(2);
+
             let config = EncoderConfig::new()
                 .usage_type(UsageType::ScreenContentRealTime)
-                .rate_control_mode(RateControlMode::Quality)
+                .rate_control_mode(RateControlMode::Bitrate)
                 .set_bitrate_bps(bitrate_bps)
                 .max_frame_rate(fps)
+                .set_multiple_thread_idc(threads)
                 .enable_skip_frame(false);
 
             let api = OpenH264API::from_source();
@@ -313,45 +368,17 @@ impl H264ScreenCapturer {
         Ok(())
     }
 
-    /// Capture one frame and encode as H.264 Annex-B.
-    /// Returns `Ok(None)` if the screen is completely unchanged (0 bytes sent!).
-    pub fn capture_and_encode(
+    fn encode_current_yuv(
         &mut self,
-        display_index: usize,
-        scale: f32,
+        dst_w: u32,
+        dst_h: u32,
         bitrate_kbps: u32,
         fps: u8,
         force_keyframe: bool,
+        ts_ms: u32,
     ) -> Result<Option<EncodedVideoFrame>> {
-        let raw_img = {
-            let monitor = self.ensure_monitor(display_index)?;
-            monitor.capture_image()?
-        };
-
-        let src_w = raw_img.width();
-        let src_h = raw_img.height();
-        let src_bytes = raw_img.as_raw();
-
-        // Ultra-fast FNV-1a stride hash (~0.15ms for 1080p) — zero 8MB copy!
-        let hash = fast_frame_hash(src_bytes);
-        if !force_keyframe && hash == self.prev_hash && self.idle_frames_skipped < 90 {
-            self.idle_frames_skipped += 1;
-            return Ok(None);
-        }
-        self.idle_frames_skipped = 0;
-        self.prev_hash = hash;
-
-        // Compute target even dimensions (H.264 YUV420 requires even width & height)
-        let clamped_scale = scale.clamp(0.35, 1.0);
-        let dst_w = (((src_w as f32) * clamped_scale).round() as u32).max(320) & !1;
-        let dst_h = (((src_h as f32) * clamped_scale).round() as u32).max(180) & !1;
-
         let bitrate_bps = bitrate_kbps.clamp(400, 12_000) * 1000;
         self.ensure_encoder(dst_w, dst_h, bitrate_bps, (fps.clamp(5, 60)) as f32)?;
-
-        // Fast inline 2x2-block RGBA -> YUV420p conversion
-        self.yuv_buf
-            .fill_from_rgba(src_bytes, src_w as usize, src_h as usize);
 
         let encoder = self.encoder.as_mut().unwrap();
         if force_keyframe || self.frames_since_keyframe == 0 || self.frames_since_keyframe >= 180 {
@@ -360,7 +387,7 @@ impl H264ScreenCapturer {
         }
 
         let bitstream = encoder
-            .encode(&self.yuv_buf)
+            .encode_at(&self.yuv_buf, Timestamp::from_millis(ts_ms as u64))
             .map_err(|e| anyhow!("H.264 encode failed: {:?}", e))?;
 
         let frame_type = bitstream.frame_type();
@@ -382,6 +409,123 @@ impl H264ScreenCapturer {
             is_keyframe,
             h264_annex_b,
         }))
+    }
+
+    /// Capture one frame and encode as H.264 Annex-B.
+    /// On Windows uses event-driven DXGI Desktop Duplication (~1-3ms capture latency)
+    /// and automatically falls back to `xcap` if DXGI is unavailable.
+    pub fn capture_and_encode(
+        &mut self,
+        display_index: usize,
+        scale: f32,
+        bitrate_kbps: u32,
+        fps: u8,
+        force_keyframe: bool,
+        ts_ms: u32,
+    ) -> Result<CaptureOutcome> {
+        let clamped_scale = scale.clamp(0.35, 1.0);
+
+        #[cfg(target_os = "windows")]
+        {
+            if self.cached_display_idx != display_index {
+                self.dxgi = None;
+                self.dxgi_retry_after = None;
+                self.cached_display_idx = display_index;
+                self.prev_hash = 0;
+            }
+
+            if self.dxgi.is_none()
+                && self
+                    .dxgi_retry_after
+                    .map(|t| Instant::now() >= t)
+                    .unwrap_or(true)
+            {
+                match DxgiCapturer::new(display_index) {
+                    Ok(cap) => {
+                        info!("DXGI Desktop Duplication active for display {}", display_index);
+                        self.dxgi = Some(cap);
+                        self.dxgi_retry_after = None;
+                    }
+                    Err(e) => {
+                        warn!("DXGI unavailable (will retry in 5s, using fallback): {}", e);
+                        self.dxgi_retry_after = Some(Instant::now() + Duration::from_secs(5));
+                    }
+                }
+            }
+
+            if let Some(mut dxgi) = self.dxgi.take() {
+                let wait_ms = (1000 / (fps.clamp(5, 60) as u32)).clamp(8, 25);
+                let mut captured_dims: Option<(u32, u32)> = None;
+                let yuv = &mut self.yuv_buf;
+
+                let res = dxgi.capture_frame(wait_ms, force_keyframe, |bgra, src_w, src_h, pitch| {
+                    let dst_w = (((src_w as f32) * clamped_scale).round() as u32).max(320) & !1;
+                    let dst_h = (((src_h as f32) * clamped_scale).round() as u32).max(180) & !1;
+                    yuv.resize(dst_w as usize, dst_h as usize);
+                    yuv.fill_from_bgra(bgra, src_w, src_h, pitch);
+                    captured_dims = Some((dst_w, dst_h));
+                });
+
+                match res {
+                    Ok(DxgiCaptureStatus::Frame) => {
+                        self.dxgi = Some(dxgi);
+                        if let Some((dst_w, dst_h)) = captured_dims {
+                            if let Some(encoded) = self.encode_current_yuv(
+                                dst_w,
+                                dst_h,
+                                bitrate_kbps,
+                                fps,
+                                force_keyframe,
+                                ts_ms,
+                            )? {
+                                return Ok(CaptureOutcome::Encoded(encoded));
+                            }
+                        }
+                        return Ok(CaptureOutcome::Unchanged { waited_event: true });
+                    }
+                    Ok(DxgiCaptureStatus::Unchanged) => {
+                        self.dxgi = Some(dxgi);
+                        return Ok(CaptureOutcome::Unchanged { waited_event: true });
+                    }
+                    Err(e) => {
+                        warn!("DXGI capture lost ({}), falling back to xcap and scheduling reinit", e);
+                        self.dxgi_retry_after = Some(Instant::now() + Duration::from_secs(2));
+                        // Drop broken DXGI capturer and fall through to xcap for this frame
+                    }
+                }
+            }
+        }
+
+        // Cross-platform / fallback capture path via xcap
+        let raw_img = {
+            let monitor = self.ensure_monitor(display_index)?;
+            monitor.capture_image()?
+        };
+
+        let src_w = raw_img.width();
+        let src_h = raw_img.height();
+        let src_bytes = raw_img.as_raw();
+
+        // Ultra-fast FNV-1a stride hash (~0.15ms for 1080p) — zero 8MB copy!
+        let hash = fast_frame_hash(src_bytes);
+        if !force_keyframe && hash == self.prev_hash && self.idle_frames_skipped < 90 {
+            self.idle_frames_skipped += 1;
+            return Ok(CaptureOutcome::Unchanged { waited_event: false });
+        }
+        self.idle_frames_skipped = 0;
+        self.prev_hash = hash;
+
+        let dst_w = (((src_w as f32) * clamped_scale).round() as u32).max(320) & !1;
+        let dst_h = (((src_h as f32) * clamped_scale).round() as u32).max(180) & !1;
+
+        self.yuv_buf.resize(dst_w as usize, dst_h as usize);
+        self.yuv_buf
+            .fill_from_rgba(src_bytes, src_w as usize, src_h as usize);
+
+        match self.encode_current_yuv(dst_w, dst_h, bitrate_kbps, fps, force_keyframe, ts_ms)? {
+            Some(encoded) => Ok(CaptureOutcome::Encoded(encoded)),
+            None => Ok(CaptureOutcome::Unchanged { waited_event: false }),
+        }
     }
 }
 
@@ -410,7 +554,7 @@ mod tests {
         cap.yuv_buf.fill_from_rgba(&rgba, 1920, 1080);
         let enc = cap.encoder.as_mut().unwrap();
         enc.force_intra_frame();
-        let bs = enc.encode(&cap.yuv_buf).unwrap();
+        let bs = enc.encode_at(&cap.yuv_buf, Timestamp::from_millis(33)).unwrap();
         let bytes = bs.to_vec();
         assert!(!bytes.is_empty());
         assert!(matches!(bs.frame_type(), FrameType::IDR | FrameType::I));

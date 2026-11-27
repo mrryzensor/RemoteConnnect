@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod capture;
 pub mod clipboard;
+#[cfg(target_os = "windows")]
+mod dxgi;
 pub mod files;
 pub mod input;
 
@@ -21,7 +23,9 @@ use tokio_tungstenite::{connect_async_with_config, tungstenite::Message as WsMes
 use tracing::{error, info, warn};
 
 use crate::audio::spawn_audio_capture;
-use crate::capture::{get_display_bounds, list_displays, DisplayBounds, H264ScreenCapturer};
+use crate::capture::{
+    get_display_bounds, list_displays, CaptureOutcome, DisplayBounds, H264ScreenCapturer,
+};
 use crate::clipboard::{
     get_clipboard_files, get_clipboard_text, set_clipboard_files, set_clipboard_text,
 };
@@ -216,6 +220,7 @@ struct StreamSettings {
     force_keyframe: AtomicBool,
     active: Arc<AtomicBool>,
     cached_bounds: Mutex<DisplayBounds>,
+    capture_thread: Mutex<Option<std::thread::Thread>>,
 }
 
 impl StreamSettings {
@@ -229,6 +234,15 @@ impl StreamSettings {
             force_keyframe: AtomicBool::new(true),
             active: Arc::new(AtomicBool::new(true)),
             cached_bounds: Mutex::new(initial_bounds),
+            capture_thread: Mutex::new(None),
+        }
+    }
+
+    fn wake_capture(&self) {
+        if let Ok(guard) = self.capture_thread.lock() {
+            if let Some(t) = guard.as_ref() {
+                t.unpark();
+            }
         }
     }
 
@@ -662,13 +676,16 @@ fn start_session(
         let video_tx = video_tx.clone();
 
         std::thread::spawn(move || {
+            if let Ok(mut guard) = settings.capture_thread.lock() {
+                *guard = Some(std::thread::current());
+            }
             let mut capturer = H264ScreenCapturer::new(0);
             let session_start = Instant::now();
 
             while settings.active.load(Ordering::Relaxed) {
                 // Backpressure: if network hasn't drained previous frame, wait briefly before encoding
                 if video_tx.capacity() == 0 {
-                    std::thread::sleep(Duration::from_millis(4));
+                    std::thread::park_timeout(Duration::from_millis(3));
                     continue;
                 }
 
@@ -678,6 +695,7 @@ fn start_session(
                 let display_idx = settings.display_index.load(Ordering::Relaxed);
                 let scale = (settings.scale_x100.load(Ordering::Relaxed) as f32) / 100.0;
                 let force_kf = settings.force_keyframe.swap(false, Ordering::AcqRel);
+                let ts_ms = session_start.elapsed().as_millis() as u32;
 
                 match capturer.capture_and_encode(
                     display_idx,
@@ -685,9 +703,9 @@ fn start_session(
                     bitrate_kbps,
                     fps,
                     force_kf,
+                    ts_ms,
                 ) {
-                    Ok(Some(encoded)) => {
-                        let ts_ms = session_start.elapsed().as_millis() as u32;
+                    Ok(CaptureOutcome::Encoded(encoded)) => {
                         // Plaintext: [0x04][1B is_keyframe][4B BE w][4B BE h][4B BE ts_ms][H.264 Annex-B]
                         let mut plain = Vec::with_capacity(14 + encoded.h264_annex_b.len());
                         plain.push(PACKET_VIDEO_H264);
@@ -705,20 +723,28 @@ fn start_session(
                                 break;
                             }
                         }
+
+                        let budget = Duration::from_millis(1000 / (fps as u64));
+                        let elapsed = frame_start.elapsed();
+                        if elapsed < budget {
+                            std::thread::park_timeout(budget - elapsed);
+                        }
                     }
-                    Ok(None) => {
-                        // Screen unchanged — zero bytes transmitted!
+                    Ok(CaptureOutcome::Unchanged { waited_event }) => {
+                        // If DXGI already waited for DWM events, loop immediately with zero extra latency.
+                        // On polling fallback (xcap), sleep briefly (8ms) so new UI changes are caught fast.
+                        if !waited_event {
+                            let idle_sleep = Duration::from_millis(8);
+                            let elapsed = frame_start.elapsed();
+                            if elapsed < idle_sleep {
+                                std::thread::park_timeout(idle_sleep - elapsed);
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("Capture/encode error: {}", e);
-                        std::thread::sleep(Duration::from_millis(50));
+                        std::thread::park_timeout(Duration::from_millis(40));
                     }
-                }
-
-                let budget = Duration::from_millis(1000 / (fps as u64));
-                let elapsed = frame_start.elapsed();
-                if elapsed < budget {
-                    std::thread::sleep(budget - elapsed);
                 }
             }
         });
@@ -835,6 +861,7 @@ fn handle_session_message(
 
         SessionMessage::RequestKeyframe => {
             sess.settings.force_keyframe.store(true, Ordering::Release);
+            sess.settings.wake_capture();
         }
 
         SessionMessage::MouseMove { x, y } => {
@@ -864,6 +891,7 @@ fn handle_session_message(
                 y,
                 bounds: sess.settings.bounds(),
             });
+            sess.settings.wake_capture();
         }
 
         SessionMessage::MouseScroll { delta_x, delta_y } => {
@@ -871,6 +899,7 @@ fn handle_session_message(
                 return;
             }
             let _ = input_tx.send(InputAction::MouseScroll { delta_x, delta_y });
+            sess.settings.wake_capture();
         }
 
         SessionMessage::KeyEvent { code, key, pressed } => {
@@ -878,6 +907,7 @@ fn handle_session_message(
                 return;
             }
             let _ = input_tx.send(InputAction::KeyEvent { code, key, pressed });
+            sess.settings.wake_capture();
         }
 
         SessionMessage::ClipboardSync { text } => {

@@ -60,6 +60,10 @@ export class RemoteViewerClient {
   private lastVideoW = 0;
   private lastVideoH = 0;
 
+  // Ordered crypto/decode queues (prevents H.264 frame & input reordering under async WebCrypto)
+  private binaryQueue: Promise<void> = Promise.resolve();
+  private sendQueue: Promise<void> = Promise.resolve();
+
   // WebAudio playback engine
   private audioCtx: AudioContext | null = null;
   private audioRecordDest: MediaStreamAudioDestinationNode | null = null;
@@ -214,11 +218,14 @@ export class RemoteViewerClient {
       }, 3000);
     };
 
-    ws.onmessage = async (event) => {
+    ws.onmessage = (event) => {
       if (typeof event.data === "string") {
-        await this.handleTextMessage(event.data);
+        void this.handleTextMessage(event.data);
       } else if (event.data instanceof ArrayBuffer) {
-        await this.handleBinaryPacket(event.data);
+        const buf = event.data;
+        this.binaryQueue = this.binaryQueue
+          .then(() => this.handleBinaryPacket(buf))
+          .catch(() => {});
       }
     };
 
@@ -556,18 +563,24 @@ export class RemoteViewerClient {
     }
   }
 
-  private async sendEncrypted(inner: Record<string, unknown>) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.e2e || !this.sessionId) {
-      return;
-    }
-    const payload = await this.e2e.encryptJson(inner);
-    this.ws.send(
-      JSON.stringify({
-        type: "encrypted_relay",
-        session_id: this.sessionId,
-        payload,
-      })
-    );
+  private sendEncrypted(inner: Record<string, unknown>): Promise<void> {
+    const task = this.sendQueue.then(async () => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.e2e || !this.sessionId) {
+        return;
+      }
+      const payload = await this.e2e.encryptJson(inner);
+      if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionId) {
+        this.ws.send(
+          JSON.stringify({
+            type: "encrypted_relay",
+            session_id: this.sessionId,
+            payload,
+          })
+        );
+      }
+    });
+    this.sendQueue = task.catch(() => {});
+    return task;
   }
 
   requestKeyframe() {

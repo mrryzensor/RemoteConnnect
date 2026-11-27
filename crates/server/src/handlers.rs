@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::state::{ActiveSession, HostPeer, OutboundTx, ServerState};
+use crate::state::{ActiveSession, HostPeer, OutboundTx, PeerChannels, ServerState};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -95,10 +95,28 @@ fn send_signal(tx: &OutboundTx, msg: &SignalMessage) {
 
 async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // High-priority control/input/signaling channel
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
+    // Bounded media relay channel (prevents relay-side bufferbloat when a peer stalls)
+    let (media_tx, mut media_rx) = mpsc::channel::<Message>(4);
+    let peer_ch = PeerChannels {
+        control_tx: control_tx.clone(),
+        media_tx,
+    };
 
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                m = control_rx.recv() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                v = media_rx.recv() => match v {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
@@ -115,7 +133,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     Err(e) => {
                         warn!("Invalid JSON signal: {}", e);
                         send_signal(
-                            &tx,
+                            &control_tx,
                             &SignalMessage::Error {
                                 code: "invalid_message".into(),
                                 message: format!("Malformed signal: {}", e),
@@ -125,7 +143,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     }
                 };
 
-                handle_signal_message(parsed, &mut role, &tx, &state);
+                handle_signal_message(parsed, &mut role, &peer_ch, &state);
             }
             Message::Binary(bin) => {
                 // Fast-path E2E encrypted binary frame relay:
@@ -136,10 +154,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                             if sess.established {
                                 match &role {
                                     PeerRole::Host { .. } => {
-                                        let _ = sess.viewer_tx.send(Message::Binary(bin));
+                                        let _ = sess.viewer_tx.media_tx.try_send(Message::Binary(bin));
                                     }
                                     PeerRole::Viewer { .. } => {
-                                        let _ = sess.host_tx.send(Message::Binary(bin));
+                                        let _ = sess.host_tx.media_tx.try_send(Message::Binary(bin));
                                     }
                                     PeerRole::Unidentified => {}
                                 }
@@ -149,7 +167,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 }
             }
             Message::Ping(payload) => {
-                let _ = tx.send(Message::Pong(payload));
+                let _ = control_tx.send(Message::Pong(payload));
             }
             Message::Close(_) => break,
             _ => {}
@@ -164,9 +182,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
 fn handle_signal_message(
     msg: SignalMessage,
     role: &mut PeerRole,
-    tx: &OutboundTx,
+    peer_ch: &PeerChannels,
     state: &Arc<ServerState>,
 ) {
+    let tx = &peer_ch.control_tx;
     match msg {
         SignalMessage::RegisterHost {
             device_id,
@@ -200,7 +219,7 @@ fn handle_signal_message(
                     os,
                     unattended_enabled,
                     connected_at: Utc::now(),
-                    tx: tx.clone(),
+                    tx: peer_ch.clone(),
                 },
             );
             *role = PeerRole::Host {
@@ -255,7 +274,7 @@ fn handle_signal_message(
                     session_id: session_id.clone(),
                     host_device_id: target.clone(),
                     host_tx: host_tx.clone(),
-                    viewer_tx: tx.clone(),
+                    viewer_tx: peer_ch.clone(),
                     established: false,
                     created_at: Utc::now(),
                 },
@@ -273,7 +292,7 @@ fn handle_signal_message(
             );
 
             send_signal(
-                &host_tx,
+                &host_tx.control_tx,
                 &SignalMessage::IncomingConnection {
                     session_id,
                     viewer_name,
@@ -297,7 +316,7 @@ fn handle_signal_message(
                     host_name = Some(host.device_name.clone());
                 }
                 sess.established = accepted;
-                let viewer_tx = sess.viewer_tx.clone();
+                let viewer_tx = sess.viewer_tx.control_tx.clone();
                 drop(sess);
 
                 if !accepted {
@@ -333,8 +352,8 @@ fn handle_signal_message(
                     payload,
                 };
                 match role {
-                    PeerRole::Host { .. } => send_signal(&sess.viewer_tx, &forward),
-                    PeerRole::Viewer { .. } => send_signal(&sess.host_tx, &forward),
+                    PeerRole::Host { .. } => send_signal(&sess.viewer_tx.control_tx, &forward),
+                    PeerRole::Viewer { .. } => send_signal(&sess.host_tx.control_tx, &forward),
                     PeerRole::Unidentified => {}
                 }
             }
@@ -345,8 +364,8 @@ fn handle_signal_message(
                 info!(session_id = %session_id, ?reason, "Session disconnected");
                 let disc = SignalMessage::Disconnect { session_id, reason };
                 match role {
-                    PeerRole::Host { .. } => send_signal(&sess.viewer_tx, &disc),
-                    PeerRole::Viewer { .. } => send_signal(&sess.host_tx, &disc),
+                    PeerRole::Host { .. } => send_signal(&sess.viewer_tx.control_tx, &disc),
+                    PeerRole::Viewer { .. } => send_signal(&sess.host_tx.control_tx, &disc),
                     PeerRole::Unidentified => {}
                 }
             }
@@ -379,7 +398,7 @@ fn cleanup_peer(role: &PeerRole, state: &Arc<ServerState>) {
             for sid in affected {
                 if let Some((_, sess)) = state.sessions.remove(&sid) {
                     send_signal(
-                        &sess.viewer_tx,
+                        &sess.viewer_tx.control_tx,
                         &SignalMessage::Disconnect {
                             session_id: sid,
                             reason: Some("Host went offline".into()),
@@ -392,7 +411,7 @@ fn cleanup_peer(role: &PeerRole, state: &Arc<ServerState>) {
             if let Some((_, sess)) = state.sessions.remove(session_id) {
                 info!(session_id = %session_id, "Viewer disconnected");
                 send_signal(
-                    &sess.host_tx,
+                    &sess.host_tx.control_tx,
                     &SignalMessage::Disconnect {
                         session_id: session_id.clone(),
                         reason: Some("Viewer disconnected".into()),

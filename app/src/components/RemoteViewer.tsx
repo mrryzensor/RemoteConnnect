@@ -57,6 +57,7 @@ export function RemoteViewer({
   onExit,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<RemoteViewerClient | null>(null);
   const lastMoveSentRef = useRef(0);
@@ -144,11 +145,18 @@ export function RemoteViewer({
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
+          canvasCtxRef.current = canvas.getContext("2d", {
+            alpha: false,
+            desynchronized: true,
+          });
         }
-        const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
-        if (ctx) {
-          ctx.drawImage(frame, 0, 0, w, h);
+        if (!canvasCtxRef.current) {
+          canvasCtxRef.current = canvas.getContext("2d", {
+            alpha: false,
+            desynchronized: true,
+          });
         }
+        canvasCtxRef.current?.drawImage(frame, 0, 0, w, h);
         frame.close();
       },
       onBitmapFrame: (bitmap, width, height) => {
@@ -161,11 +169,18 @@ export function RemoteViewer({
         if (canvas.width !== width || canvas.height !== height) {
           canvas.width = width;
           canvas.height = height;
+          canvasCtxRef.current = canvas.getContext("2d", {
+            alpha: false,
+            desynchronized: true,
+          });
         }
-        const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
-        if (ctx) {
-          ctx.drawImage(bitmap, 0, 0);
+        if (!canvasCtxRef.current) {
+          canvasCtxRef.current = canvas.getContext("2d", {
+            alpha: false,
+            desynchronized: true,
+          });
         }
+        canvasCtxRef.current?.drawImage(bitmap, 0, 0);
         bitmap.close();
       },
       onDecoderError: (msg) => {
@@ -234,15 +249,29 @@ export function RemoteViewer({
 
   useEffect(() => {
     const onFsChange = () => {
-      if (!isTauriEnv()) {
-        const active = Boolean(document.fullscreenElement);
+      const active = Boolean(document.fullscreenElement);
+      if (!isTauriEnv() || active) {
         setIsFullscreen(active);
-        if (!active) setToolbarRevealed(false);
       }
+      setShowSettings(false);
+      setToolbarRevealed(false);
     };
     document.addEventListener("fullscreenchange", onFsChange);
     return () => document.removeEventListener("fullscreenchange", onFsChange);
   }, []);
+
+  useEffect(() => {
+    if (hideToolbarTimerRef.current !== null) {
+      window.clearTimeout(hideToolbarTimerRef.current);
+      hideToolbarTimerRef.current = null;
+    }
+    if (isFullscreen) {
+      setShowSettings(false);
+      setToolbarRevealed(false);
+    } else {
+      setToolbarRevealed(false);
+    }
+  }, [isFullscreen]);
 
   useEffect(() => {
     if (!isRecording) {
@@ -473,6 +502,10 @@ export function RemoteViewer({
 
   const toggleFullscreen = async () => {
     const next = !isFullscreen;
+    if (hideToolbarTimerRef.current !== null) {
+      window.clearTimeout(hideToolbarTimerRef.current);
+      hideToolbarTimerRef.current = null;
+    }
     setShowSettings(false);
     setToolbarRevealed(false);
     if (isTauriEnv()) {
@@ -495,6 +528,7 @@ export function RemoteViewer({
         await document.exitFullscreen().catch(() => { });
       }
     }
+    stageRef.current?.focus();
   };
 
   const revealToolbar = () => {
@@ -516,7 +550,11 @@ export function RemoteViewer({
   };
 
   return (
-    <div className={`viewer-shell ${isFullscreen ? "fullscreen" : ""}`}>
+    <div
+      className={`viewer-shell ${isFullscreen ? "fullscreen" : ""} ${
+        isFullscreen && toolbarRevealed ? "toolbar-revealed" : ""
+      }`}
+    >
       {isFullscreen && !toolbarRevealed && (
         <div
           className="fullscreen-hover-zone"

@@ -7,6 +7,13 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 pub type OutboundTx = mpsc::UnboundedSender<Message>;
+pub type MediaTx = mpsc::Sender<Message>;
+
+#[derive(Debug, Clone)]
+pub struct PeerChannels {
+    pub control_tx: OutboundTx,
+    pub media_tx: MediaTx,
+}
 
 #[derive(Debug, Clone)]
 pub struct HostPeer {
@@ -15,15 +22,15 @@ pub struct HostPeer {
     pub os: String,
     pub unattended_enabled: bool,
     pub connected_at: DateTime<Utc>,
-    pub tx: OutboundTx,
+    pub tx: PeerChannels,
 }
 
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
     pub session_id: String,
     pub host_device_id: String,
-    pub host_tx: OutboundTx,
-    pub viewer_tx: OutboundTx,
+    pub host_tx: PeerChannels,
+    pub viewer_tx: PeerChannels,
     pub established: bool,
     pub created_at: DateTime<Utc>,
 }

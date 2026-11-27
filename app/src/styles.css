@@ -831,6 +831,10 @@ input::placeholder {
   backdrop-filter: blur(14px);
 }
 
+.viewer-shell.fullscreen:not(.toolbar-revealed) .viewer-settings-bar {
+  display: none !important;
+}
+
 .fullscreen-hover-zone {
   position: fixed;
   top: 0;
