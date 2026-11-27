@@ -1,15 +1,13 @@
-use std::time::{Duration, Instant};
-
 use anyhow::{anyhow, Result};
 use openh264::encoder::{Encoder, EncoderConfig, FrameType, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
-use openh264::{OpenH264API, Timestamp};
+use openh264::OpenH264API;
 use remoteconnect_protocol::DisplayInfo;
 use tracing::{info, warn};
 use xcap::Monitor;
 
 #[cfg(target_os = "windows")]
-use crate::dxgi::{DxgiCaptureStatus, DxgiCapturer};
+use crate::win_gdi::WinGdiCapturer;
 
 /// List all available physical monitors.
 pub fn list_displays() -> Vec<DisplayInfo> {
@@ -107,8 +105,8 @@ impl FastYuv420 {
 
     #[cfg(target_os = "windows")]
     #[inline]
-    fn fill_from_bgra(&mut self, src: &[u8], src_w: usize, src_h: usize, src_stride: usize) {
-        self.fill_from_pixels::<true>(src, src_w, src_h, src_stride);
+    fn fill_from_bgra(&mut self, src: &[u8], src_w: usize, src_h: usize) {
+        self.fill_from_pixels::<true>(src, src_w, src_h, src_w * 4);
     }
 
     /// Blazing-fast 2x2-block integer BT.601 RGBA/BGRA -> YUV420p conversion with inline scaling.
@@ -254,19 +252,17 @@ pub struct EncodedVideoFrame {
     pub h264_annex_b: Vec<u8>,
 }
 
-/// Result of one capture iteration, indicating whether the capturer already waited on DWM.
+/// Result of one capture iteration.
 pub enum CaptureOutcome {
     Encoded(EncodedVideoFrame),
     Unchanged { waited_event: bool },
 }
 
-/// Stateful, ultra-low-latency screen capture (DXGI Desktop Duplication on Windows with
-/// automatic `xcap` fallback) + multi-threaded OpenH264 encoder.
+/// Stateful, ultra-low-latency screen capture (zero-alloc persistent GDI DIB section on
+/// Windows without remote cursor, with automatic `xcap` fallback) + OpenH264 encoder.
 pub struct H264ScreenCapturer {
     #[cfg(target_os = "windows")]
-    dxgi: Option<DxgiCapturer>,
-    #[cfg(target_os = "windows")]
-    dxgi_retry_after: Option<Instant>,
+    win_gdi: Option<WinGdiCapturer>,
     monitor: Option<Monitor>,
     cached_display_idx: usize,
     encoder: Option<Encoder>,
@@ -283,13 +279,13 @@ pub struct H264ScreenCapturer {
 impl H264ScreenCapturer {
     pub fn new(display_index: usize) -> Self {
         #[cfg(target_os = "windows")]
-        let dxgi = match DxgiCapturer::new(display_index) {
+        let win_gdi = match WinGdiCapturer::new(display_index) {
             Ok(cap) => {
-                info!("DXGI Desktop Duplication initialized for display {}", display_index);
+                info!("Zero-alloc GDI DIB capturer initialized for display {}", display_index);
                 Some(cap)
             }
             Err(e) => {
-                warn!("DXGI init failed (using GDI fallback): {}", e);
+                warn!("WinGdiCapturer init failed (using xcap fallback): {}", e);
                 None
             }
         };
@@ -299,9 +295,7 @@ impl H264ScreenCapturer {
             .and_then(|ms| ms.into_iter().nth(display_index));
         Self {
             #[cfg(target_os = "windows")]
-            dxgi,
-            #[cfg(target_os = "windows")]
-            dxgi_retry_after: None,
+            win_gdi,
             monitor,
             cached_display_idx: display_index,
             encoder: None,
@@ -341,16 +335,12 @@ impl H264ScreenCapturer {
             || (self.enc_fps - fps).abs() > 5.0;
 
         if needs_reinit {
-            let threads = std::thread::available_parallelism()
-                .map(|n| (n.get() as u16).clamp(2, 4))
-                .unwrap_or(2);
-
+            // Quality mode + auto threading keeps screen content crisp and artifact-free.
             let config = EncoderConfig::new()
                 .usage_type(UsageType::ScreenContentRealTime)
-                .rate_control_mode(RateControlMode::Bitrate)
+                .rate_control_mode(RateControlMode::Quality)
                 .set_bitrate_bps(bitrate_bps)
                 .max_frame_rate(fps)
-                .set_multiple_thread_idc(threads)
                 .enable_skip_frame(false);
 
             let api = OpenH264API::from_source();
@@ -375,7 +365,6 @@ impl H264ScreenCapturer {
         bitrate_kbps: u32,
         fps: u8,
         force_keyframe: bool,
-        ts_ms: u32,
     ) -> Result<Option<EncodedVideoFrame>> {
         let bitrate_bps = bitrate_kbps.clamp(400, 12_000) * 1000;
         self.ensure_encoder(dst_w, dst_h, bitrate_bps, (fps.clamp(5, 60)) as f32)?;
@@ -387,7 +376,7 @@ impl H264ScreenCapturer {
         }
 
         let bitstream = encoder
-            .encode_at(&self.yuv_buf, Timestamp::from_millis(ts_ms as u64))
+            .encode(&self.yuv_buf)
             .map_err(|e| anyhow!("H.264 encode failed: {:?}", e))?;
 
         let frame_type = bitstream.frame_type();
@@ -412,8 +401,8 @@ impl H264ScreenCapturer {
     }
 
     /// Capture one frame and encode as H.264 Annex-B.
-    /// On Windows uses event-driven DXGI Desktop Duplication (~1-3ms capture latency)
-    /// and automatically falls back to `xcap` if DXGI is unavailable.
+    /// On Windows uses a persistent zero-alloc GDI DIB section (no remote cursor, no 8 MB
+    /// per-frame allocation, no BGRA->RGBA copy) with automatic `xcap` fallback.
     pub fn capture_and_encode(
         &mut self,
         display_index: usize,
@@ -421,76 +410,50 @@ impl H264ScreenCapturer {
         bitrate_kbps: u32,
         fps: u8,
         force_keyframe: bool,
-        ts_ms: u32,
+        _ts_ms: u32,
     ) -> Result<CaptureOutcome> {
         let clamped_scale = scale.clamp(0.35, 1.0);
 
         #[cfg(target_os = "windows")]
         {
             if self.cached_display_idx != display_index {
-                self.dxgi = None;
-                self.dxgi_retry_after = None;
+                self.win_gdi = WinGdiCapturer::new(display_index).ok();
                 self.cached_display_idx = display_index;
                 self.prev_hash = 0;
             }
 
-            if self.dxgi.is_none()
-                && self
-                    .dxgi_retry_after
-                    .map(|t| Instant::now() >= t)
-                    .unwrap_or(true)
-            {
-                match DxgiCapturer::new(display_index) {
-                    Ok(cap) => {
-                        info!("DXGI Desktop Duplication active for display {}", display_index);
-                        self.dxgi = Some(cap);
-                        self.dxgi_retry_after = None;
-                    }
-                    Err(e) => {
-                        warn!("DXGI unavailable (will retry in 5s, using fallback): {}", e);
-                        self.dxgi_retry_after = Some(Instant::now() + Duration::from_secs(5));
-                    }
-                }
-            }
-
-            if let Some(mut dxgi) = self.dxgi.take() {
-                let wait_ms = (1000 / (fps.clamp(5, 60) as u32)).clamp(8, 25);
-                let mut captured_dims: Option<(u32, u32)> = None;
-                let yuv = &mut self.yuv_buf;
-
-                let res = dxgi.capture_frame(wait_ms, force_keyframe, |bgra, src_w, src_h, pitch| {
-                    let dst_w = (((src_w as f32) * clamped_scale).round() as u32).max(320) & !1;
-                    let dst_h = (((src_h as f32) * clamped_scale).round() as u32).max(180) & !1;
-                    yuv.resize(dst_w as usize, dst_h as usize);
-                    yuv.fill_from_bgra(bgra, src_w, src_h, pitch);
-                    captured_dims = Some((dst_w, dst_h));
-                });
-
-                match res {
-                    Ok(DxgiCaptureStatus::Frame) => {
-                        self.dxgi = Some(dxgi);
-                        if let Some((dst_w, dst_h)) = captured_dims {
-                            if let Some(encoded) = self.encode_current_yuv(
-                                dst_w,
-                                dst_h,
-                                bitrate_kbps,
-                                fps,
-                                force_keyframe,
-                                ts_ms,
-                            )? {
-                                return Ok(CaptureOutcome::Encoded(encoded));
-                            }
+            if let Some(mut gdi) = self.win_gdi.take() {
+                match gdi.capture_bgra() {
+                    Ok((bgra, src_w, src_h)) => {
+                        let hash = fast_frame_hash(bgra);
+                        if !force_keyframe && hash == self.prev_hash && self.idle_frames_skipped < 90 {
+                            self.idle_frames_skipped += 1;
+                            self.win_gdi = Some(gdi);
+                            return Ok(CaptureOutcome::Unchanged { waited_event: false });
                         }
-                        return Ok(CaptureOutcome::Unchanged { waited_event: true });
-                    }
-                    Ok(DxgiCaptureStatus::Unchanged) => {
-                        self.dxgi = Some(dxgi);
-                        return Ok(CaptureOutcome::Unchanged { waited_event: true });
+                        self.idle_frames_skipped = 0;
+                        self.prev_hash = hash;
+
+                        let dst_w = (((src_w as f32) * clamped_scale).round() as u32).max(320) & !1;
+                        let dst_h = (((src_h as f32) * clamped_scale).round() as u32).max(180) & !1;
+                        self.yuv_buf.resize(dst_w as usize, dst_h as usize);
+                        self.yuv_buf.fill_from_bgra(bgra, src_w, src_h);
+                        self.win_gdi = Some(gdi);
+
+                        return match self.encode_current_yuv(
+                            dst_w,
+                            dst_h,
+                            bitrate_kbps,
+                            fps,
+                            force_keyframe,
+                        )? {
+                            Some(encoded) => Ok(CaptureOutcome::Encoded(encoded)),
+                            None => Ok(CaptureOutcome::Unchanged { waited_event: false }),
+                        };
                     }
                     Err(e) => {
-                        warn!("DXGI capture lost ({}), falling back to xcap and scheduling reinit", e);
-                        self.dxgi_retry_after = Some(Instant::now() + Duration::from_secs(2));
-                        // Drop broken DXGI capturer and fall through to xcap for this frame
+                        warn!("WinGdiCapturer failed ({}), reinitializing / falling back to xcap", e);
+                        // Drop broken capturer and fall through to xcap
                     }
                 }
             }
@@ -522,7 +485,7 @@ impl H264ScreenCapturer {
         self.yuv_buf
             .fill_from_rgba(src_bytes, src_w as usize, src_h as usize);
 
-        match self.encode_current_yuv(dst_w, dst_h, bitrate_kbps, fps, force_keyframe, ts_ms)? {
+        match self.encode_current_yuv(dst_w, dst_h, bitrate_kbps, fps, force_keyframe)? {
             Some(encoded) => Ok(CaptureOutcome::Encoded(encoded)),
             None => Ok(CaptureOutcome::Unchanged { waited_event: false }),
         }
@@ -554,7 +517,7 @@ mod tests {
         cap.yuv_buf.fill_from_rgba(&rgba, 1920, 1080);
         let enc = cap.encoder.as_mut().unwrap();
         enc.force_intra_frame();
-        let bs = enc.encode_at(&cap.yuv_buf, Timestamp::from_millis(33)).unwrap();
+        let bs = enc.encode(&cap.yuv_buf).unwrap();
         let bytes = bs.to_vec();
         assert!(!bytes.is_empty());
         assert!(matches!(bs.frame_type(), FrameType::IDR | FrameType::I));

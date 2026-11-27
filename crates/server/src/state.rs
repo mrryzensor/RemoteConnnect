@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 pub type OutboundTx = mpsc::UnboundedSender<Message>;
-pub type MediaTx = mpsc::Sender<Message>;
+pub type MediaTx = mpsc::UnboundedSender<Message>;
 
 #[derive(Debug, Clone)]
 pub struct PeerChannels {

@@ -2,7 +2,7 @@ pub mod audio;
 pub mod capture;
 pub mod clipboard;
 #[cfg(target_os = "windows")]
-mod dxgi;
+mod win_gdi;
 pub mod files;
 pub mod input;
 

@@ -97,8 +97,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     // High-priority control/input/signaling channel
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
-    // Bounded media relay channel (prevents relay-side bufferbloat when a peer stalls)
-    let (media_tx, mut media_rx) = mpsc::channel::<Message>(4);
+    // Lossless media relay channel (never drops mid-GOP H.264 delta frames, avoiding macroblock corruption;
+    // backpressure is handled at the host agent before encoding)
+    let (media_tx, mut media_rx) = mpsc::unbounded_channel::<Message>();
     let peer_ch = PeerChannels {
         control_tx: control_tx.clone(),
         media_tx,
@@ -154,10 +155,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                             if sess.established {
                                 match &role {
                                     PeerRole::Host { .. } => {
-                                        let _ = sess.viewer_tx.media_tx.try_send(Message::Binary(bin));
+                                        let _ = sess.viewer_tx.media_tx.send(Message::Binary(bin));
                                     }
                                     PeerRole::Viewer { .. } => {
-                                        let _ = sess.host_tx.media_tx.try_send(Message::Binary(bin));
+                                        let _ = sess.host_tx.media_tx.send(Message::Binary(bin));
                                     }
                                     PeerRole::Unidentified => {}
                                 }
