@@ -41,6 +41,7 @@ interface Props {
   authToken?: string | null;
   theme: "dark" | "light";
   onToggleTheme: () => void;
+  onConnected?: (info: { deviceId: string; hostName: string; pin?: string }) => void;
   onExit: (message?: string) => void;
 }
 
@@ -52,6 +53,7 @@ export function RemoteViewer({
   authToken,
   theme,
   onToggleTheme,
+  onConnected,
   onExit,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -123,6 +125,11 @@ export function RemoteViewer({
         setHostName(info.hostName);
         setDisplays(info.displays);
         setPermissions(info.permissions);
+        onConnected?.({
+          deviceId: targetDeviceId,
+          hostName: info.hostName,
+          pin,
+        });
         stageRef.current?.focus();
       },
       onVideoFrame: (frame: VideoFrame) => {

@@ -238,6 +238,18 @@ export default function App() {
           authToken={config.auth_token}
           theme={theme}
           onToggleTheme={toggleTheme}
+          onConnected={async ({ deviceId, hostName, pin }) => {
+            const existing = config.saved_devices.find((d) => d.id === deviceId);
+            const updatedList = await saveDevice({
+              id: deviceId,
+              name: existing?.name || hostName || deviceId,
+              pin: pin?.trim() ? pin.trim() : existing?.pin ?? null,
+              notes: existing?.notes ?? null,
+            });
+            setConfig((prev) =>
+              prev ? { ...prev, saved_devices: updatedList } : prev
+            );
+          }}
           onExit={(msg) => {
             setActiveViewer(null);
             if (msg) notify(msg);
