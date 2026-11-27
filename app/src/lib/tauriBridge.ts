@@ -246,9 +246,9 @@ export async function relaunchWithUiMode(
 
 export async function getAppVersion(): Promise<string> {
   if (isTauriEnv()) {
-    return invoke<string>("get_app_version").catch(() => "0.1.12");
+    return invoke<string>("get_app_version").catch(() => "0.1.13");
   }
-  return "0.1.12";
+  return "0.1.13";
 }
 
 export async function installWindowsUpdate(downloadUrl: string): Promise<void> {

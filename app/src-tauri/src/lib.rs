@@ -740,7 +740,7 @@ fn relaunch_with_ui_mode(app: AppHandle, state: State<'_, DesktopState>, ui_mode
     };
     {
         let mut cfg = state.config.lock().unwrap();
-        cfg.preferences.ui_mode = normalized;
+        cfg.preferences.ui_mode = normalized.clone();
         cfg.save();
     }
     #[cfg(not(target_os = "android"))]
@@ -749,7 +749,13 @@ fn relaunch_with_ui_mode(app: AppHandle, state: State<'_, DesktopState>, ui_mode
             agent.stop();
         }
         if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).spawn();
+            let mut cmd = std::process::Command::new(exe);
+            if normalized == "native" {
+                cmd.arg("--native");
+            } else if normalized == "webview" {
+                cmd.arg("--webview");
+            }
+            let _ = cmd.spawn();
         }
         app.exit(0);
     }
@@ -938,7 +944,9 @@ pub fn run() {
             viewer_active: AtomicBool::new(false),
         })
         .setup(move |app| {
-            // Ensure Android/mobile uses the app's writable private config directory
+            // Only override config dir on Android (where ProjectDirs returns None).
+            // On desktop, ProjectDirs is used consistently both before and inside Tauri setup.
+            #[cfg(target_os = "android")]
             if let Ok(app_cfg_dir) = app.path().app_config_dir() {
                 let _ = CONFIG_DIR_OVERRIDE.set(app_cfg_dir);
                 let reloaded = AppConfig::load_or_create();
