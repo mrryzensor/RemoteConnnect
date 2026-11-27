@@ -139,6 +139,23 @@ html.is-android .modal-backdrop {
   padding-bottom: max(env(safe-area-inset-bottom, 0px), 28px);
 }
 
+html.is-android .fullscreen-hover-zone {
+  top: max(env(safe-area-inset-top, 0px), 32px);
+  height: 32px;
+}
+
+html.is-android .fullscreen-handle-pill {
+  padding: 5px 18px;
+  font-size: 12px;
+  opacity: 0.88;
+  background: rgba(15, 23, 42, 0.88);
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+html.is-android .viewer-shell.fullscreen .viewer-toolbar {
+  padding-top: max(env(safe-area-inset-top, 0px), 32px);
+}
+
 /* Scrollbars */
 ::-webkit-scrollbar {
   width: 7px;

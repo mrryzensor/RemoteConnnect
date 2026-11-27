@@ -120,21 +120,19 @@ jobs:
           npx tauri android init --ci
           npx tauri android build --apk --target aarch64
 
-      - name: Sign APK for direct installation
+      - name: Sign APK with consistent release key
         shell: bash
         run: |
           mkdir -p android-assets
           APK_SRC=$(find app/src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -n 1)
           echo "Found APK: $APK_SRC"
-          keytool -genkeypair -v -keystore /tmp/rc-release.keystore -alias remoteconnect \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass remoteconnect -keypass remoteconnect \
-            -dname "CN=RemoteConnect, OU=App, O=RemoteConnect, L=Lima, S=Lima, C=PE"
           APKSIGNER="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
           ZIPALIGN="${ANDROID_HOME}/build-tools/34.0.0/zipalign"
           "$ZIPALIGN" -f -p 4 "$APK_SRC" /tmp/aligned.apk
-          "$APKSIGNER" sign --ks /tmp/rc-release.keystore --ks-pass pass:remoteconnect \
-            --key-pass pass:remoteconnect --out android-assets/RemoteConnect-Android-arm64.apk /tmp/aligned.apk
+          "$APKSIGNER" sign \
+            --key .github/android-signing/release.pk8 \
+            --cert .github/android-signing/release.x509.pem \
+            --out android-assets/RemoteConnect-Android-arm64.apk /tmp/aligned.apk
           ls -lh android-assets/
 
       - name: Upload Android APK Artifact

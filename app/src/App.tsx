@@ -36,6 +36,7 @@ import {
   type SessionPermissions,
 } from "./types";
 import {
+  checkLatestRelease,
   disconnectHostSession,
   fetchDeviceOnlineStatus,
   getAgentStatus,
@@ -263,46 +264,72 @@ function MainApp() {
     try {
       const currentVer = await getAppVersion();
       setAppVersion(currentVer);
-      const res = await fetch(
-        "https://api.github.com/repos/mrryzensor/RemoteConnnect/releases/latest",
-        { headers: { Accept: "application/vnd.github+json" }, cache: "no-store" }
-      );
-      if (!res.ok) {
-        return `No se pudo consultar GitHub (HTTP ${res.status})`;
+      const isAndroid = /Android/i.test(navigator.userAgent);
+
+      // 1. Prefer rate-limit-free native Rust check on Windows desktop
+      let tag: string | undefined;
+      let windowsUrl: string | undefined;
+      let androidUrl: string | undefined;
+
+      const nativeCheck = await checkLatestRelease();
+      if (nativeCheck) {
+        tag = nativeCheck.latest_tag;
+        windowsUrl = nativeCheck.windows_url;
+        androidUrl = nativeCheck.android_url;
+      } else {
+        // 2. Fallback to GitHub Releases API (Android / Web)
+        const res = await fetch(
+          "https://api.github.com/repos/mrryzensor/RemoteConnnect/releases/latest",
+          { headers: { Accept: "application/vnd.github+json" }, cache: "no-store" }
+        );
+        if (!res.ok) {
+          return `No se pudo consultar GitHub (HTTP ${res.status})`;
+        }
+        const rel = (await res.json()) as {
+          tag_name?: string;
+          assets?: Array<{ name: string; browser_download_url: string }>;
+        };
+        tag = rel.tag_name;
+        const assets = rel.assets ?? [];
+        windowsUrl = assets.find(
+          (a) =>
+            a.name.toLowerCase().includes("portable") &&
+            a.name.toLowerCase().endsWith(".exe")
+        )?.browser_download_url;
+        androidUrl = assets.find((a) =>
+          a.name.toLowerCase().endsWith(".apk")
+        )?.browser_download_url;
       }
-      const rel = (await res.json()) as {
-        tag_name?: string;
-        assets?: Array<{ name: string; browser_download_url: string }>;
-      };
-      const tag = rel.tag_name;
+
       if (!tag) return "No se encontró ninguna versión publicada.";
       if (!isNewer(tag, currentVer)) {
         return `✓ Ya tienes la última versión (v${currentVer})`;
       }
 
-      const assets = rel.assets ?? [];
-      const isAndroid = /Android/i.test(navigator.userAgent);
-
       if (isAndroid) {
-        const apk = assets.find((a) => a.name.toLowerCase().endsWith(".apk"));
-        if (!apk) return `Nueva versión ${tag} encontrada, pero aún se está compilando el APK.`;
+        const apkUrl =
+          androidUrl ||
+          `https://github.com/mrryzensor/RemoteConnnect/releases/download/${tag}/RemoteConnect-Android-arm64.apk`;
         setUpdatingStatus(`Actualizando a ${tag}...`);
-        window.location.href = apk.browser_download_url;
-        window.setTimeout(() => setUpdatingStatus(null), 8000);
+        // Trigger external browser/DownloadManager download in Android WebView
+        const a = document.createElement("a");
+        a.href = apkUrl;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.open(apkUrl, "_blank");
+        window.setTimeout(() => setUpdatingStatus(null), 7000);
         return `Descargando ${tag}...`;
       }
 
-      const portable = assets.find(
-        (a) =>
-          a.name.toLowerCase().includes("portable") &&
-          a.name.toLowerCase().endsWith(".exe")
-      );
-      if (!portable) {
-        return `Nueva versión ${tag} encontrada, pero aún se está compilando el ejecutable.`;
-      }
+      const exeUrl =
+        windowsUrl ||
+        `https://github.com/mrryzensor/RemoteConnnect/releases/download/${tag}/RemoteConnect-Portable-x64.exe`;
 
       setUpdatingStatus(`Actualizando a ${tag}...`);
-      await installWindowsUpdate(portable.browser_download_url);
+      await installWindowsUpdate(exeUrl);
       return `Actualizando a ${tag}...`;
     } catch (err) {
       setUpdatingStatus(null);

@@ -244,11 +244,30 @@ export async function relaunchWithUiMode(
   }
 }
 
+export interface LatestReleaseInfo {
+  current_version: string;
+  latest_tag: string;
+  has_update: boolean;
+  windows_url: string;
+  android_url: string;
+}
+
+export async function checkLatestRelease(): Promise<LatestReleaseInfo | null> {
+  if (isTauriEnv()) {
+    try {
+      return await invoke<LatestReleaseInfo>("check_latest_release");
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export async function getAppVersion(): Promise<string> {
   if (isTauriEnv()) {
-    return invoke<string>("get_app_version").catch(() => "0.1.15");
+    return invoke<string>("get_app_version").catch(() => "0.1.16");
   }
-  return "0.1.15";
+  return "0.1.16";
 }
 
 export async function hasDesktopShortcut(): Promise<boolean> {

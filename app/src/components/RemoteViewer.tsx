@@ -635,8 +635,13 @@ export function RemoteViewer({
     }
 
     const t = e.touches[0];
-    if (Math.hypot(t.clientX - ts.startX, t.clientY - ts.startY) > 7) {
+    if (!ts.moved) {
+      if (Math.hypot(t.clientX - ts.startX, t.clientY - ts.startY) <= 7) {
+        return;
+      }
       ts.moved = true;
+      ts.lastX = t.clientX;
+      ts.lastY = t.clientY;
       if (ts.longPressTimer !== null) {
         window.clearTimeout(ts.longPressTimer);
         ts.longPressTimer = null;
@@ -645,14 +650,29 @@ export function RemoteViewer({
 
     if (touchMode === "cursor") {
       const rect = e.currentTarget.getBoundingClientRect();
-      const dx = ((t.clientX - ts.lastX) / Math.max(1, rect.width)) * 1.45;
-      const dy = ((t.clientY - ts.lastY) / Math.max(1, rect.height)) * 1.45;
+      const baseW = rect.width / Math.max(1, zoomRef.current);
+      const baseH = rect.height / Math.max(1, zoomRef.current);
+      const dx = ((t.clientX - ts.lastX) / Math.max(1, baseW)) * 1.45;
+      const dy = ((t.clientY - ts.lastY) / Math.max(1, baseH)) * 1.45;
       ts.lastX = t.clientX;
       ts.lastY = t.clientY;
 
       const nx = Math.max(0, Math.min(1, virtualCursorRef.current.x + dx));
       const ny = Math.max(0, Math.min(1, virtualCursorRef.current.y + dy));
       virtualCursorRef.current = { x: nx, y: ny };
+
+      // RustDesk-style auto-follow: pan the zoomed screen smoothly to follow the cursor
+      if (zoomRef.current > 1.02) {
+        const z = zoomRef.current;
+        const maxPanX = (baseW * (z - 1)) / 2;
+        const maxPanY = (baseH * (z - 1)) / 2;
+        const nextPan = {
+          x: Math.max(-maxPanX, Math.min(maxPanX, (0.5 - nx) * baseW * (z - 1))),
+          y: Math.max(-maxPanY, Math.min(maxPanY, (0.5 - ny) * baseH * (z - 1))),
+        };
+        panRef.current = nextPan;
+        setPan(nextPan);
+      }
 
       const now = performance.now();
       if (now - lastMoveSentRef.current < 16) return;
@@ -927,7 +947,7 @@ export function RemoteViewer({
           onClick={revealToolbar}
         >
           <div className="fullscreen-handle-pill">
-            <ChevronDown size={11} />
+            <ChevronDown size={12} />
             Menú
           </div>
         </div>

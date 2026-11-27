@@ -53,6 +53,18 @@ export class RemoteViewerClient {
   private keyPair: E2eKeyPair | null = null;
   private downloads = new Map<string, PendingDownload>();
   private pingTimer: number | null = null;
+  private wsKeepaliveTimer: number | null = null;
+  private reconnectTimer: number | null = null;
+  private manualDisconnect = false;
+  private reconnectAttempts = 0;
+  private lastConnectParams: {
+    serverUrl: string;
+    targetDeviceId: string;
+    viewerName: string;
+    pin?: string;
+    authToken?: string | null;
+    preferP2p?: boolean;
+  } | null = null;
 
   // WebCodecs hardware-accelerated H.264 decoder
   private videoDecoder: VideoDecoder | null = null;
@@ -204,7 +216,9 @@ export class RemoteViewerClient {
     authToken?: string | null;
     preferP2p?: boolean;
   }): Promise<void> {
-    this.disconnect();
+    this.cleanupConnectionOnly();
+    this.manualDisconnect = false;
+    this.lastConnectParams = params;
     this.preferP2p = params.preferP2p ?? true;
     this.cb.onStatus("connecting", "Estableciendo túnel E2E...");
 
@@ -227,7 +241,7 @@ export class RemoteViewerClient {
         })
       );
 
-      // Measure RTT ping every 2.5 seconds (uses P2P control channel when active!)
+      // Measure RTT ping every 2.5 seconds (uses P2P control channel when active)
       this.pingTimer = window.setInterval(() => {
         if (this.p2pControlReady && this.rtcControlDc?.readyState === "open") {
           try {
@@ -243,6 +257,14 @@ export class RemoteViewerClient {
           this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
         }
       }, 2500);
+
+      // Dedicated WebSocket keepalive every 15s so Cloudflare/proxies NEVER drop the
+      // signaling socket for idle timeout while traffic flows over direct WebRTC P2P!
+      this.wsKeepaliveTimer = window.setInterval(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+        }
+      }, 15000);
     };
 
     ws.onmessage = (event) => {
@@ -257,7 +279,7 @@ export class RemoteViewerClient {
     };
 
     ws.onerror = () => {
-      this.cb.onStatus("disconnected", "Error de conexión WebSocket con el servidor");
+      // onclose handles reconnect or final disconnect
     };
 
     ws.onclose = () => {
@@ -265,30 +287,48 @@ export class RemoteViewerClient {
         this.ws = null;
         this.e2e = null;
         this.closeP2p();
-        this.closeP2p();
-    this.closeVideoDecoder();
+        this.closeVideoDecoder();
         if (this.pingTimer !== null) {
           window.clearInterval(this.pingTimer);
           this.pingTimer = null;
         }
-        this.cb.onStatus("disconnected", "Sesión finalizada");
+        if (this.wsKeepaliveTimer !== null) {
+          window.clearInterval(this.wsKeepaliveTimer);
+          this.wsKeepaliveTimer = null;
+        }
+        if (!this.manualDisconnect && this.lastConnectParams && this.reconnectAttempts < 4) {
+          this.reconnectAttempts++;
+          const delayMs = this.reconnectAttempts * 1500;
+          this.cb.onStatus(
+            "connecting",
+            `Reconectando automáticamente (intento ${this.reconnectAttempts}/4)...`
+          );
+          const paramsCopy = this.lastConnectParams;
+          this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = null;
+            if (!this.manualDisconnect) {
+              void this.connect(paramsCopy);
+            }
+          }, delayMs);
+        } else {
+          this.cb.onStatus("disconnected", "Sesión finalizada");
+        }
       }
     };
   }
 
-  disconnect(reason?: string) {
+  private cleanupConnectionOnly() {
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.pingTimer !== null) {
       window.clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
-    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionId) {
-      this.ws.send(
-        JSON.stringify({
-          type: "disconnect",
-          session_id: this.sessionId,
-          reason: reason ?? "Viewer closed session",
-        })
-      );
+    if (this.wsKeepaliveTimer !== null) {
+      window.clearInterval(this.wsKeepaliveTimer);
+      this.wsKeepaliveTimer = null;
     }
     if (this.ws) {
       const old = this.ws;
@@ -308,6 +348,21 @@ export class RemoteViewerClient {
     this.downloads.clear();
   }
 
+  disconnect(reason?: string) {
+    this.manualDisconnect = true;
+    this.reconnectAttempts = 0;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionId) {
+      this.ws.send(
+        JSON.stringify({
+          type: "disconnect",
+          session_id: this.sessionId,
+          reason: reason ?? "Viewer closed session",
+        })
+      );
+    }
+    this.cleanupConnectionOnly();
+  }
+
   private async handleTextMessage(raw: string) {
     let msg: Record<string, unknown>;
     try {
@@ -318,9 +373,12 @@ export class RemoteViewerClient {
 
     switch (msg.type) {
       case "pong": {
-        const sentTs = Number(msg.timestamp || 0);
-        if (sentTs > 0) {
-          this.cb.onMetrics({ rttMs: Math.max(1, Date.now() - sentTs) });
+        // Keep displaying direct P2P RTT when P2P control channel is active
+        if (!this.p2pControlReady) {
+          const sentTs = Number(msg.timestamp || 0);
+          if (sentTs > 0) {
+            this.cb.onMetrics({ rttMs: Math.max(1, Date.now() - sentTs) });
+          }
         }
         break;
       }
@@ -328,6 +386,7 @@ export class RemoteViewerClient {
       case "session_ready": {
         const accepted = Boolean(msg.accepted);
         if (!accepted) {
+          this.manualDisconnect = true;
           this.cb.onStatus(
             "disconnected",
             (msg.reason as string) || "Conexión rechazada por el equipo remoto"
@@ -335,6 +394,7 @@ export class RemoteViewerClient {
           this.disconnect();
           return;
         }
+        this.reconnectAttempts = 0;
         const sessionId = msg.session_id as string;
         const hostPub = msg.host_public_key as string;
         if (!this.keyPair || !hostPub) {
@@ -380,6 +440,7 @@ export class RemoteViewerClient {
       }
 
       case "disconnect": {
+        this.manualDisconnect = true;
         this.cb.onStatus(
           "disconnected",
           (msg.reason as string) || "El equipo remoto cerró la sesión"
@@ -389,6 +450,7 @@ export class RemoteViewerClient {
       }
 
       case "error": {
+        this.manualDisconnect = true;
         this.cb.onStatus(
           "disconnected",
           (msg.message as string) || "Error del servidor"

@@ -610,6 +610,88 @@ fn create_desktop_shortcut() -> Result<String, String> {
     shortcut::create()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestReleaseInfo {
+    pub current_version: String,
+    pub latest_tag: String,
+    pub has_update: bool,
+    pub windows_url: String,
+    pub android_url: String,
+}
+
+fn parse_semver_tuple(v: &str) -> (u32, u32, u32) {
+    let clean = v.trim().trim_start_matches(['v', 'V']).split('-').next().unwrap_or("");
+    let mut parts = clean.split('.').map(|s| s.parse::<u32>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+async fn check_latest_release() -> Result<LatestReleaseInfo, String> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let tag = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            // Follow GitHub's /releases/latest redirect (no 60 req/hr API rate limit!)
+            let out = std::process::Command::new("curl.exe")
+                .args([
+                    "-fsSLI",
+                    "-o",
+                    "NUL",
+                    "-w",
+                    "%{url_effective}",
+                    "https://github.com/mrryzensor/RemoteConnnect/releases/latest",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("Error consultando actualizaciones: {}", e))?;
+
+            if !out.status.success() {
+                return Err("No se pudo conectar con GitHub Releases".into());
+            }
+            let effective = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let tag = effective
+                .rsplit('/')
+                .next()
+                .filter(|s| s.starts_with('v') || s.starts_with('V'))
+                .ok_or_else(|| format!("No se pudo detectar versión desde {}", effective))?
+                .to_string();
+            Ok(tag)
+        })
+        .await
+        .map_err(|e| format!("Error interno: {}", e))??;
+
+        let has_update = parse_semver_tuple(&tag) > parse_semver_tuple(&current_version);
+        let windows_url = format!(
+            "https://github.com/mrryzensor/RemoteConnnect/releases/download/{}/RemoteConnect-Portable-x64.exe",
+            tag
+        );
+        let android_url = format!(
+            "https://github.com/mrryzensor/RemoteConnnect/releases/download/{}/RemoteConnect-Android-arm64.apk",
+            tag
+        );
+        return Ok(LatestReleaseInfo {
+            current_version,
+            latest_tag: tag,
+            has_update,
+            windows_url,
+            android_url,
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("use_js_fallback".into())
+    }
+}
+
 #[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1115,6 +1197,7 @@ pub fn run() {
 
     builder
         .invoke_handler(tauri::generate_handler![
+            check_latest_release,
             get_app_version,
             has_desktop_shortcut,
             create_desktop_shortcut,
