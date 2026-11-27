@@ -265,9 +265,9 @@ export async function checkLatestRelease(): Promise<LatestReleaseInfo | null> {
 
 export async function getAppVersion(): Promise<string> {
   if (isTauriEnv()) {
-    return invoke<string>("get_app_version").catch(() => "0.1.16");
+    return invoke<string>("get_app_version").catch(() => "0.1.17");
   }
-  return "0.1.16";
+  return "0.1.17";
 }
 
 export async function hasDesktopShortcut(): Promise<boolean> {

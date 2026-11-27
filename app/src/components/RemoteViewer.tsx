@@ -73,6 +73,7 @@ export function RemoteViewer({
   const stageRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<RemoteViewerClient | null>(null);
   const lastMoveSentRef = useRef(0);
+  const lastTouchTimeRef = useRef(0);
   const onConnectedRef = useRef(onConnected);
   onConnectedRef.current = onConnected;
 
@@ -462,6 +463,7 @@ export function RemoteViewer({
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!permissions.allow_input) return;
+    if (performance.now() - lastTouchTimeRef.current < 800) return; // ignore synthetic mouse after touch
     const now = performance.now();
     if (now - lastMoveSentRef.current < 16) return; // ~60 Hz ultra-responsive mouse
     lastMoveSentRef.current = now;
@@ -470,6 +472,7 @@ export function RemoteViewer({
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (performance.now() - lastTouchTimeRef.current < 800) return; // ignore synthetic mouse after touch
     e.preventDefault();
     clientRef.current?.resumeAudio();
     stageRef.current?.focus();
@@ -479,6 +482,7 @@ export function RemoteViewer({
   };
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (performance.now() - lastTouchTimeRef.current < 800) return; // ignore synthetic mouse after touch
     e.preventDefault();
     if (!permissions.allow_input) return;
     const { x, y } = getNormalizedCoords(e);
@@ -537,6 +541,7 @@ export function RemoteViewer({
   };
 
   const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    lastTouchTimeRef.current = performance.now();
     clientRef.current?.resumeAudio();
     if (!permissions.allow_input || e.touches.length === 0) return;
     const ts = touchStateRef.current;
@@ -595,6 +600,7 @@ export function RemoteViewer({
   };
 
   const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    lastTouchTimeRef.current = performance.now();
     if (!permissions.allow_input || e.touches.length === 0) return;
     const ts = touchStateRef.current;
 
@@ -689,6 +695,8 @@ export function RemoteViewer({
   };
 
   const handleTouchEnd = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    lastTouchTimeRef.current = performance.now();
+    e.preventDefault();
     const ts = touchStateRef.current;
     if (ts.longPressTimer !== null) {
       window.clearTimeout(ts.longPressTimer);
