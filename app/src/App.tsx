@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  Settings,
   ShieldCheck,
   Sliders,
   Sun,
@@ -49,11 +50,13 @@ import {
   setAutostart,
   setViewerMode,
   updateAccessSettings,
+  updatePreferences,
   updateServerSettings,
 } from "./lib/tauriBridge";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { HostSessionWidget } from "./components/HostSessionWidget";
 import { RemoteViewer } from "./components/RemoteViewer";
+import { SettingsModal } from "./components/SettingsModal";
 
 interface ActiveViewerSession {
   targetDeviceId: string;
@@ -108,8 +111,9 @@ function MainApp() {
   const [pendingApproval, setPendingApproval] = useState<IncomingApproval | null>(null);
   const [hostSessions, setHostSessions] = useState<ActiveHostSession[]>([]);
 
-  // Server settings modal
+  // Server & App Settings modals
   const [showServerModal, setShowServerModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [serverUrlDraft, setServerUrlDraft] = useState("");
   const [authTokenDraft, setAuthTokenDraft] = useState("");
   const [deviceNameDraft, setDeviceNameDraft] = useState("");
@@ -205,9 +209,13 @@ function MainApp() {
           notify(`Sesión remota iniciada por ${ev.viewer_name}`);
           break;
         case "session_ended":
-          setHostSessions((prev) =>
-            prev.filter((s) => s.session_id !== ev.session_id)
-          );
+          setHostSessions((prev) => {
+            const ended = prev.find((s) => s.session_id === ev.session_id);
+            if (ended) {
+              notify(`Desconectado: ${ended.viewer_name} cerró la sesión`);
+            }
+            return prev.filter((s) => s.session_id !== ev.session_id);
+          });
           break;
         case "error":
           notify(`Error del servidor: ${ev.message}`);
@@ -303,6 +311,7 @@ function MainApp() {
           viewerName={config.device_name}
           pin={activeViewer.pin}
           authToken={config.auth_token}
+          preferences={config.preferences}
           theme={theme}
           onToggleTheme={toggleTheme}
           onConnected={async ({ deviceId, hostName, pin }) => {
@@ -442,6 +451,8 @@ function MainApp() {
                 ? "Conectando"
                 : agentStatus === "web-only"
                 ? "Visor Web"
+                : agentStatus === "mobile-viewer"
+                ? "Visor Android"
                 : "Sin conexión"}
             </span>
           </div>
@@ -682,11 +693,12 @@ function MainApp() {
               Cifrado E2E AES-256-GCM
             </span>
             <button
-              className="icon-btn"
-              onClick={() => setShowServerModal(true)}
-              title="Servidor Rust"
+              className="btn btn-secondary btn-sm"
+              onClick={() => setShowSettingsModal(true)}
+              title="Configuración general, grabaciones y calidad"
             >
-              <Server size={17} />
+              <Settings size={14} />
+              Configuración
             </button>
             <button
               className="icon-btn"
@@ -886,6 +898,43 @@ function MainApp() {
           </section>
         </main>
       </div>
+
+      {/* Full App Settings Modal */}
+      {showSettingsModal && (
+        <SettingsModal
+          config={config}
+          theme={theme}
+          autostartEnabled={autostartEnabled}
+          onToggleTheme={toggleTheme}
+          onToggleAutostart={async (next) => {
+            try {
+              const res = await setAutostart(next);
+              setAutostartEnabled(res);
+              notify(
+                res
+                  ? "RemoteConnect iniciará automáticamente con Windows"
+                  : "Inicio automático con Windows desactivado"
+              );
+            } catch {
+              notify("No se pudo actualizar el inicio automático");
+            }
+          }}
+          onSavePreferences={async (prefs) => {
+            const updated = await updatePreferences(prefs);
+            setConfig(updated);
+            notify("Configuración guardada");
+          }}
+          onSaveServer={async (url, token, name) => {
+            const updated = await updateServerSettings(url, token, name);
+            setConfig(updated);
+            setServerUrlDraft(updated.server_url);
+            setAuthTokenDraft(updated.auth_token ?? "");
+            setDeviceNameDraft(updated.device_name);
+            notify("Configuración de servidor actualizada");
+          }}
+          onClose={() => setShowSettingsModal(false)}
+        />
+      )}
 
       {/* Access Security, Custom Password, PIN & Default Permissions Modal */}
       {showAccessModal && (

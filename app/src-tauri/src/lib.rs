@@ -1,18 +1,29 @@
+#[cfg(not(target_os = "android"))]
+mod native_ui;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use directories::ProjectDirs;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use directories::{ProjectDirs, UserDirs};
+#[cfg(not(target_os = "android"))]
 use remoteconnect_agent::{start_agent, AgentConfig, AgentEvent, AgentHandle};
 use remoteconnect_protocol::{generate_device_id, generate_pin, SessionPermissions};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "android"))]
 use tauri::menu::{Menu, MenuItem};
+#[cfg(not(target_os = "android"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+#[cfg(not(target_os = "android"))]
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindowBuilder,
     WindowEvent,
 };
+#[cfg(target_os = "android")]
+use tauri::{AppHandle, Manager, State};
+#[cfg(not(target_os = "android"))]
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +42,74 @@ pub struct ActiveHostSessionInfo {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_fps() -> u8 {
+    30
+}
+
+fn default_bitrate() -> u32 {
+    2500
+}
+
+fn default_scale() -> f32 {
+    1.0
+}
+
+fn default_ui_mode() -> String {
+    "auto".into()
+}
+
+pub fn default_recordings_dir() -> String {
+    if let Some(ud) = UserDirs::new() {
+        if let Some(vid) = ud.video_dir() {
+            return vid.join("RemoteConnect").to_string_lossy().to_string();
+        }
+        return ud
+            .home_dir()
+            .join("RemoteConnect-Recordings")
+            .to_string_lossy()
+            .to_string();
+    }
+    "RemoteConnect-Recordings".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPreferences {
+    #[serde(default = "default_recordings_dir")]
+    pub recordings_dir: String,
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+    #[serde(default = "default_true")]
+    pub show_host_widget: bool,
+    #[serde(default = "default_fps")]
+    pub default_fps: u8,
+    #[serde(default = "default_bitrate")]
+    pub default_bitrate_kbps: u32,
+    #[serde(default = "default_scale")]
+    pub default_scale: f32,
+    #[serde(default)]
+    pub mute_audio_on_connect: bool,
+    #[serde(default = "default_true")]
+    pub prefer_p2p: bool,
+    #[serde(default = "default_ui_mode")]
+    pub ui_mode: String,
+}
+
+impl Default for UserPreferences {
+    fn default() -> Self {
+        Self {
+            recordings_dir: default_recordings_dir(),
+            minimize_to_tray: true,
+            show_host_widget: true,
+            default_fps: 30,
+            default_bitrate_kbps: 2500,
+            default_scale: 1.0,
+            mute_audio_on_connect: false,
+            prefer_p2p: true,
+            ui_mode: default_ui_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +131,8 @@ pub struct AppConfig {
     pub saved_devices: Vec<SavedDevice>,
     #[serde(default)]
     pub autostart_initialized: bool,
+    #[serde(default)]
+    pub preferences: UserPreferences,
 }
 
 impl AppConfig {
@@ -87,6 +168,7 @@ impl AppConfig {
             auth_token: None,
             saved_devices: vec![],
             autostart_initialized: false,
+            preferences: UserPreferences::default(),
         };
         cfg.save();
         cfg
@@ -102,6 +184,7 @@ impl AppConfig {
 
 struct DesktopState {
     config: Mutex<AppConfig>,
+    #[cfg(not(target_os = "android"))]
     agent: Mutex<Option<AgentHandle>>,
     agent_status: Mutex<String>,
     active_sessions: Mutex<Vec<ActiveHostSessionInfo>>,
@@ -113,7 +196,7 @@ struct DesktopState {
 // ============================================================
 
 #[cfg(target_os = "windows")]
-mod autostart {
+pub(crate) mod autostart {
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
@@ -206,16 +289,87 @@ mod autostart {
 }
 
 // ============================================================
+// Windows WebView2 Runtime Check & Headless Fallback
+// ============================================================
+
+#[cfg(target_os = "windows")]
+mod webview2_check {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
+        HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+
+    const WV2_KEYS: &[(HKEY, &str)] = &[
+        (
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        ),
+    ];
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn is_installed() -> bool {
+        unsafe {
+            let pv_name = to_wide("pv");
+            for (root, path) in WV2_KEYS {
+                let subkey = to_wide(path);
+                let mut hkey = Default::default();
+                if RegOpenKeyExW(*root, PCWSTR(subkey.as_ptr()), Some(0), KEY_READ, &mut hkey)
+                    .is_ok()
+                {
+                    let mut buf = [0u8; 64];
+                    let mut len = buf.len() as u32;
+                    let ok = RegQueryValueExW(
+                        hkey,
+                        PCWSTR(pv_name.as_ptr()),
+                        None,
+                        None,
+                        Some(buf.as_mut_ptr()),
+                        Some(&mut len),
+                    )
+                    .is_ok()
+                        && len > 4;
+                    let _ = RegCloseKey(hkey);
+                    if ok {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod webview2_check {
+    pub fn is_installed() -> bool {
+        true
+    }
+}
+
+// ============================================================
 // Minimalist Host Session Floating Widget Window
 // ============================================================
 
+#[cfg(not(target_os = "android"))]
 fn show_or_create_host_widget(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("host-widget") {
         let _ = win.show();
         return;
     }
 
-    let width = 276.0;
+    let width = 304.0;
     let height = 42.0;
 
     let builder = WebviewWindowBuilder::new(
@@ -248,12 +402,17 @@ fn show_or_create_host_widget(app: &AppHandle) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn hide_host_widget(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("host-widget") {
         let _ = win.hide();
     }
 }
 
+#[cfg(target_os = "android")]
+fn hide_host_widget(_app: &AppHandle) {}
+
+#[cfg(not(target_os = "android"))]
 fn reveal_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -262,6 +421,15 @@ fn reveal_main_window(app: &AppHandle) {
     }
 }
 
+#[cfg(target_os = "android")]
+fn reveal_main_window(_app: &AppHandle) {}
+
+#[cfg(target_os = "android")]
+fn spawn_embedded_agent(_app: &AppHandle, state: &DesktopState) {
+    *state.agent_status.lock().unwrap() = "mobile-viewer".into();
+}
+
+#[cfg(not(target_os = "android"))]
 fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
     let cfg = state.config.lock().unwrap().clone();
     if let Some(old) = state.agent.lock().unwrap().take() {
@@ -318,12 +486,15 @@ fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
                         }
                         // Show ONLY the ultra-minimalist floating widget on the remote host
                         // (hide the full main window unless the user is actively viewing another PC)
+                        let show_widget = st.config.lock().unwrap().preferences.show_host_widget;
                         if !st.viewer_active.load(Ordering::Relaxed) {
                             if let Some(main_win) = app_handle.get_webview_window("main") {
                                 let _ = main_win.hide();
                             }
                         }
-                        show_or_create_host_widget(&app_handle);
+                        if show_widget {
+                            show_or_create_host_widget(&app_handle);
+                        }
                     }
                     AgentEvent::SessionEnded { session_id, .. } => {
                         let remaining = {
@@ -332,7 +503,16 @@ fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
                             list.len()
                         };
                         if remaining == 0 {
-                            hide_host_widget(&app_handle);
+                            // Keep the widget visible for 2.5s so the user clearly sees "Desconectado"
+                            let app_for_hide = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                                if let Some(state_now) = app_for_hide.try_state::<DesktopState>() {
+                                    if state_now.active_sessions.lock().unwrap().is_empty() {
+                                        hide_host_widget(&app_for_hide);
+                                    }
+                                }
+                            });
                         }
                     }
                     AgentEvent::Error { .. } => {}
@@ -379,6 +559,121 @@ fn show_main_window(app: AppHandle) {
 }
 
 #[tauri::command]
+fn hide_widget_window(app: AppHandle) {
+    hide_host_widget(&app);
+}
+
+#[tauri::command]
+fn update_preferences(
+    state: State<'_, DesktopState>,
+    mut preferences: UserPreferences,
+) -> AppConfig {
+    if preferences.recordings_dir.trim().is_empty() {
+        preferences.recordings_dir = default_recordings_dir();
+    }
+    preferences.default_fps = preferences.default_fps.clamp(10, 60);
+    preferences.default_bitrate_kbps = preferences.default_bitrate_kbps.clamp(500, 8000);
+    preferences.default_scale = preferences.default_scale.clamp(0.5, 1.0);
+
+    let mut cfg = state.config.lock().unwrap();
+    cfg.preferences = preferences;
+    cfg.save();
+    cfg.clone()
+}
+
+#[tauri::command]
+fn save_recording_file(
+    state: State<'_, DesktopState>,
+    file_name: String,
+    data_b64: String,
+) -> Result<String, String> {
+    let dir_str = {
+        let cfg = state.config.lock().unwrap();
+        if cfg.preferences.recordings_dir.trim().is_empty() {
+            default_recordings_dir()
+        } else {
+            cfg.preferences.recordings_dir.clone()
+        }
+    };
+    let dir = PathBuf::from(&dir_str);
+    fs::create_dir_all(&dir).map_err(|e| format!("No se pudo crear la carpeta: {}", e))?;
+
+    let safe_name: String = file_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let full_path = dir.join(if safe_name.is_empty() {
+        "RemoteConnect-recording.webm".to_string()
+    } else {
+        safe_name
+    });
+
+    let bytes = B64
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("Error decodificando grabación: {}", e))?;
+    fs::write(&full_path, bytes).map_err(|e| format!("Error guardando video: {}", e))?;
+    Ok(full_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    let dir = PathBuf::from(if path.trim().is_empty() {
+        default_recordings_dir()
+    } else {
+        path
+    });
+    let _ = fs::create_dir_all(&dir);
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("No se pudo abrir la carpeta: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("No se pudo abrir la carpeta: {}", e))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("No se pudo abrir la carpeta: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn relaunch_with_ui_mode(app: AppHandle, state: State<'_, DesktopState>, ui_mode: String) {
+    let normalized = match ui_mode.as_str() {
+        "native" | "webview" | "auto" => ui_mode,
+        _ => "auto".into(),
+    };
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.preferences.ui_mode = normalized;
+        cfg.save();
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Some(agent) = state.agent.lock().unwrap().take() {
+            agent.stop();
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+        app.exit(0);
+    }
+    #[cfg(target_os = "android")]
+    let _ = app;
+}
+
+#[tauri::command]
 fn update_server_settings(
     app: AppHandle,
     state: State<'_, DesktopState>,
@@ -415,6 +710,7 @@ fn update_access_settings(
     cfg.default_permissions = default_permissions;
     cfg.save();
 
+    #[cfg(not(target_os = "android"))]
     if let Some(handle) = state.agent.lock().unwrap().as_ref() {
         handle.update_access(
             pin,
@@ -432,15 +728,17 @@ fn regenerate_pin(state: State<'_, DesktopState>) -> AppConfig {
     let new_pin = generate_pin();
     let mut cfg = state.config.lock().unwrap();
     cfg.pin = new_pin.clone();
-    let pin_enabled = cfg.pin_enabled;
-    let custom_pw = cfg.custom_password.clone();
-    let custom_pw_enabled = cfg.custom_password_enabled;
-    let perms = cfg.default_permissions;
-    cfg.save();
-
-    if let Some(handle) = state.agent.lock().unwrap().as_ref() {
-        handle.update_access(new_pin, pin_enabled, custom_pw, custom_pw_enabled, perms);
+    #[cfg(not(target_os = "android"))]
+    {
+        let pin_enabled = cfg.pin_enabled;
+        let custom_pw = cfg.custom_password.clone();
+        let custom_pw_enabled = cfg.custom_password_enabled;
+        let perms = cfg.default_permissions;
+        if let Some(handle) = state.agent.lock().unwrap().as_ref() {
+            handle.update_access(new_pin, pin_enabled, custom_pw, custom_pw_enabled, perms);
+        }
     }
+    cfg.save();
     cfg.clone()
 }
 
@@ -451,16 +749,22 @@ fn respond_incoming_request(
     accepted: bool,
     permissions: SessionPermissions,
 ) {
+    #[cfg(not(target_os = "android"))]
     if let Some(handle) = state.agent.lock().unwrap().as_ref() {
         handle.respond_approval(session_id, accepted, permissions);
     }
+    #[cfg(target_os = "android")]
+    let _ = (state, session_id, accepted, permissions);
 }
 
 #[tauri::command]
 fn disconnect_host_session(state: State<'_, DesktopState>, session_id: String) {
+    #[cfg(not(target_os = "android"))]
     if let Some(handle) = state.agent.lock().unwrap().as_ref() {
         handle.disconnect_session(session_id);
     }
+    #[cfg(target_os = "android")]
+    let _ = (state, session_id);
 }
 
 #[tauri::command]
@@ -486,84 +790,139 @@ fn remove_device(state: State<'_, DesktopState>, device_id: String) -> Vec<Saved
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt::try_init();
+    #[allow(unused_mut)]
     let mut initial_cfg = AppConfig::load_or_create();
-    let start_in_background = std::env::args().any(|a| a == "--background");
 
-    // Enable Windows auto-start automatically on first launch (can be toggled anytime in UI)
-    if !initial_cfg.autostart_initialized {
-        let _ = autostart::set_enabled(true);
-        initial_cfg.autostart_initialized = true;
-        initial_cfg.save();
-    } else if autostart::is_enabled() {
-        // Keep registry path updated in case the portable exe was moved/replaced
-        let _ = autostart::set_enabled(true);
-    }
+    #[cfg(not(target_os = "android"))]
+    let start_in_background = {
+        let args: Vec<String> = std::env::args().collect();
+        let bg = args.iter().any(|a| a == "--background");
+        let force_native_flag = args.iter().any(|a| a == "--native");
+        let force_webview_flag = args.iter().any(|a| a == "--webview");
 
-    tauri::Builder::default()
+        // Enable Windows auto-start automatically on first launch (can be toggled anytime in UI)
+        if !initial_cfg.autostart_initialized {
+            let _ = autostart::set_enabled(true);
+            initial_cfg.autostart_initialized = true;
+            initial_cfg.save();
+        } else if autostart::is_enabled() {
+            // Keep registry path updated in case the portable exe was moved/replaced
+            let _ = autostart::set_enabled(true);
+        }
+
+        // Determine whether to launch the native GPU UI (either by user preference/flag
+        // or automatically when Microsoft Edge WebView2 Runtime is not installed).
+        let use_native_ui = if force_native_flag {
+            true
+        } else if force_webview_flag {
+            !webview2_check::is_installed()
+        } else {
+            initial_cfg.preferences.ui_mode == "native" || !webview2_check::is_installed()
+        };
+
+        if use_native_ui {
+            native_ui::run_native_fallback(initial_cfg, bg);
+            return;
+        }
+        bg
+    };
+
+    let builder = tauri::Builder::default()
         .manage(DesktopState {
             config: Mutex::new(initial_cfg),
+            #[cfg(not(target_os = "android"))]
             agent: Mutex::new(None),
-            agent_status: Mutex::new("offline".into()),
+            agent_status: Mutex::new(
+                if cfg!(target_os = "android") {
+                    "mobile-viewer"
+                } else {
+                    "offline"
+                }
+                .into(),
+            ),
             active_sessions: Mutex::new(vec![]),
             viewer_active: AtomicBool::new(false),
         })
         .setup(move |app| {
-            // 1. Setup System Tray icon + menu
-            let open_item = MenuItem::with_id(app, "open", "Abrir RemoteConnect", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Salir completamente", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+            #[cfg(not(target_os = "android"))]
+            {
+                // 1. Setup System Tray icon + menu
+                let open_item =
+                    MenuItem::with_id(app, "open", "Abrir RemoteConnect", true, None::<&str>)?;
+                let quit_item =
+                    MenuItem::with_id(app, "quit", "Salir completamente", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
 
-            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
-                .tooltip("RemoteConnect — Disponible en segundo plano")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => reveal_main_window(app),
-                    "quit" => {
-                        if let Some(st) = app.try_state::<DesktopState>() {
-                            if let Some(agent) = st.agent.lock().unwrap().take() {
-                                agent.stop();
+                let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                    .tooltip("RemoteConnect — Disponible en segundo plano")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "open" => reveal_main_window(app),
+                        "quit" => {
+                            if let Some(st) = app.try_state::<DesktopState>() {
+                                if let Some(agent) = st.agent.lock().unwrap().take() {
+                                    agent.stop();
+                                }
                             }
+                            app.exit(0);
                         }
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        reveal_main_window(tray.app_handle());
-                    }
-                });
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            reveal_main_window(tray.app_handle());
+                        }
+                    });
 
-            if let Some(icon) = app.default_window_icon().cloned() {
-                tray_builder = tray_builder.icon(icon);
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    tray_builder = tray_builder.icon(icon);
+                }
+                let _ = tray_builder.build(app)?;
+
+                // 2. Show main window only when NOT launched with --background
+                if !start_in_background {
+                    reveal_main_window(app.handle());
+                }
             }
-            let _ = tray_builder.build(app)?;
 
-            // 2. Show main window only when NOT launched with --background
-            if !start_in_background {
-                reveal_main_window(app.handle());
-            }
-
-            // 3. Start embedded host agent so this PC is always reachable
+            // 3. Start embedded host agent on desktop (no-op on Android viewer)
             let state = app.state::<DesktopState>();
             spawn_embedded_agent(app.handle(), &state);
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    // Minimize to system tray instead of killing the background agent
+        });
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.on_window_event(|window, event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            if window.label() == "host-widget" {
+                api.prevent_close();
+                let _ = window.hide();
+            } else if window.label() == "main" {
+                let minimize = window
+                    .app_handle()
+                    .try_state::<DesktopState>()
+                    .map(|st| st.config.lock().unwrap().preferences.minimize_to_tray)
+                    .unwrap_or(true);
+                if minimize {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if let Some(st) = window.app_handle().try_state::<DesktopState>() {
+                    if let Some(agent) = st.agent.lock().unwrap().take() {
+                        agent.stop();
+                    }
+                    window.app_handle().exit(0);
                 }
             }
-        })
+        }
+    });
+
+    builder
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_agent_status,
@@ -572,6 +931,11 @@ pub fn run() {
             set_autostart,
             set_viewer_mode,
             show_main_window,
+            hide_widget_window,
+            update_preferences,
+            save_recording_file,
+            open_folder,
+            relaunch_with_ui_mode,
             update_server_settings,
             update_access_settings,
             regenerate_pin,
@@ -581,5 +945,5 @@ pub fn run() {
             remove_device,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running RemoteConnect desktop application");
+        .expect("error while running RemoteConnect application");
 }

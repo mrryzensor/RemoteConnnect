@@ -19,6 +19,30 @@ export interface SavedDevice {
   notes?: string | null;
 }
 
+export interface UserPreferences {
+  recordings_dir: string;
+  minimize_to_tray: boolean;
+  show_host_widget: boolean;
+  default_fps: number;
+  default_bitrate_kbps: number;
+  default_scale: number;
+  mute_audio_on_connect: boolean;
+  prefer_p2p: boolean;
+  ui_mode: "auto" | "webview" | "native";
+}
+
+export const DEFAULT_PREFERENCES: UserPreferences = {
+  recordings_dir: "",
+  minimize_to_tray: true,
+  show_host_widget: true,
+  default_fps: 30,
+  default_bitrate_kbps: 2500,
+  default_scale: 1.0,
+  mute_audio_on_connect: false,
+  prefer_p2p: true,
+  ui_mode: "auto",
+};
+
 export interface AppConfig {
   device_id: string;
   device_name: string;
@@ -30,6 +54,7 @@ export interface AppConfig {
   server_url: string;
   auth_token?: string | null;
   saved_devices: SavedDevice[];
+  preferences?: UserPreferences;
 }
 
 export interface DisplayInfo {

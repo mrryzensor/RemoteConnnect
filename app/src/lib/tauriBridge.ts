@@ -2,11 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   DEFAULT_PERMISSIONS,
+  DEFAULT_PREFERENCES,
   type ActiveHostSession,
   type AgentEvent,
   type AppConfig,
   type SavedDevice,
   type SessionPermissions,
+  type UserPreferences,
 } from "../types";
 
 export function isTauriEnv(): boolean {
@@ -197,6 +199,48 @@ export async function setViewerMode(active: boolean): Promise<void> {
 export async function showMainWindow(): Promise<void> {
   if (isTauriEnv()) {
     await invoke("show_main_window").catch(() => {});
+  }
+}
+
+export async function hideWidgetWindow(): Promise<void> {
+  if (isTauriEnv()) {
+    await invoke("hide_widget_window").catch(() => {});
+  }
+}
+
+export async function updatePreferences(
+  preferences: UserPreferences
+): Promise<AppConfig> {
+  if (isTauriEnv()) {
+    return invoke<AppConfig>("update_preferences", { preferences });
+  }
+  const cfg = loadWebConfig();
+  cfg.preferences = { ...DEFAULT_PREFERENCES, ...preferences };
+  saveWebConfig(cfg);
+  return cfg;
+}
+
+export async function saveRecordingFile(
+  fileName: string,
+  dataB64: string
+): Promise<string> {
+  if (isTauriEnv()) {
+    return invoke<string>("save_recording_file", { fileName, dataB64 });
+  }
+  throw new Error("saveRecordingFile only available in desktop app");
+}
+
+export async function openFolder(path: string): Promise<void> {
+  if (isTauriEnv()) {
+    await invoke("open_folder", { path });
+  }
+}
+
+export async function relaunchWithUiMode(
+  uiMode: "auto" | "webview" | "native"
+): Promise<void> {
+  if (isTauriEnv()) {
+    await invoke("relaunch_with_ui_mode", { uiMode });
   }
 }
 

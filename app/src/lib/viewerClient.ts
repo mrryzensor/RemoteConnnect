@@ -66,6 +66,7 @@ export class RemoteViewerClient {
   private sendQueue: Promise<void> = Promise.resolve();
 
   // Direct WebRTC P2P DataChannels (LAN / STUN UDP, automatic fallback to WS relay)
+  private preferP2p = true;
   private rtcPc: RTCPeerConnection | null = null;
   private rtcControlDc: RTCDataChannel | null = null;
   private rtcMediaDc: RTCDataChannel | null = null;
@@ -201,8 +202,10 @@ export class RemoteViewerClient {
     viewerName: string;
     pin?: string;
     authToken?: string | null;
+    preferP2p?: boolean;
   }): Promise<void> {
     this.disconnect();
+    this.preferP2p = params.preferP2p ?? true;
     this.cb.onStatus("connecting", "Estableciendo túnel E2E...");
 
     this.keyPair = await E2eKeyPair.generate();
@@ -343,7 +346,9 @@ export class RemoteViewerClient {
         this.e2e = await this.keyPair.deriveSession(hostPub, sessionId);
         await this.initVideoDecoder();
         this.requestKeyframe();
-        void this.startP2pNegotiation();
+        if (this.preferP2p) {
+          void this.startP2pNegotiation();
+        }
 
         const permissions: SessionPermissions =
           (msg.permissions as SessionPermissions) || { ...DEFAULT_PERMISSIONS };

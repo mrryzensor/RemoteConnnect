@@ -21,14 +21,17 @@ import {
   Zap,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { isTauriEnv } from "../lib/tauriBridge";
+import { isTauriEnv, saveRecordingFile } from "../lib/tauriBridge";
+import { bytesToBase64 } from "../lib/crypto";
 import {
   DEFAULT_PERMISSIONS,
+  DEFAULT_PREFERENCES,
   formatBytes,
   type ClipboardFileInfo,
   type DisplayInfo,
   type FileEntry,
   type SessionPermissions,
+  type UserPreferences,
 } from "../types";
 import { RemoteViewerClient } from "../lib/viewerClient";
 import { FileTransferModal } from "./FileTransferModal";
@@ -39,6 +42,7 @@ interface Props {
   viewerName: string;
   pin?: string;
   authToken?: string | null;
+  preferences?: UserPreferences;
   theme: "dark" | "light";
   onToggleTheme: () => void;
   onConnected?: (info: { deviceId: string; hostName: string; pin?: string }) => void;
@@ -51,11 +55,16 @@ export function RemoteViewer({
   viewerName,
   pin,
   authToken,
+  preferences,
   theme,
   onToggleTheme,
   onConnected,
   onExit,
 }: Props) {
+  const effectivePrefs: UserPreferences = {
+    ...DEFAULT_PREFERENCES,
+    ...(preferences ?? {}),
+  };
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -72,14 +81,14 @@ export function RemoteViewer({
     ...DEFAULT_PERMISSIONS,
   });
   const [selectedDisplay, setSelectedDisplay] = useState(0);
-  const [fps, setFps] = useState(30);
-  const [bitrateKbps, setBitrateKbps] = useState(2500);
-  const [scale, setScale] = useState(1.0);
+  const [fps, setFps] = useState(effectivePrefs.default_fps);
+  const [bitrateKbps, setBitrateKbps] = useState(effectivePrefs.default_bitrate_kbps);
+  const [scale, setScale] = useState(effectivePrefs.default_scale);
   const [liveFps, setLiveFps] = useState(0);
   const [liveKbps, setLiveKbps] = useState(0);
   const [rttMs, setRttMs] = useState<number | null>(null);
   const [transportMode, setTransportMode] = useState<"p2p" | "relay">("relay");
-  const [audioMuted, setAudioMuted] = useState(false);
+  const [audioMuted, setAudioMuted] = useState(effectivePrefs.mute_audio_on_connect);
   const [showSettings, setShowSettings] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [toolbarRevealed, setToolbarRevealed] = useState(false);
@@ -133,6 +142,19 @@ export function RemoteViewer({
           pin,
         });
         stageRef.current?.focus();
+        client.setAudioMuted(effectivePrefs.mute_audio_on_connect);
+        if (
+          effectivePrefs.default_fps !== 30 ||
+          effectivePrefs.default_bitrate_kbps !== 2500 ||
+          effectivePrefs.default_scale !== 1.0
+        ) {
+          client.sendStreamConfig(
+            effectivePrefs.default_fps,
+            effectivePrefs.default_bitrate_kbps,
+            0,
+            effectivePrefs.default_scale
+          );
+        }
       },
       onVideoFrame: (frame: VideoFrame) => {
         framesInSecond++;
@@ -234,6 +256,7 @@ export function RemoteViewer({
       viewerName,
       pin,
       authToken,
+      preferP2p: effectivePrefs.prefer_p2p,
     });
 
     return () => {
@@ -325,14 +348,27 @@ export function RemoteViewer({
           recordedChunksRef.current.push(ev.data);
         }
       };
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const safeHost = hostName.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const fileName = `RemoteConnect-${safeHost}-${stamp}.webm`;
+
+        if (isTauriEnv()) {
+          try {
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            const savedPath = await saveRecordingFile(fileName, bytesToBase64(bytes));
+            flashToast(`Grabación guardada en: ${savedPath}`);
+            return;
+          } catch {
+            // Fallback to browser download if native save fails
+          }
+        }
+
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `RemoteConnect-${safeHost}-${stamp}.webm`;
+        a.download = fileName;
         a.click();
         URL.revokeObjectURL(url);
         flashToast("Grabación guardada localmente en esta PC");
@@ -414,6 +450,92 @@ export function RemoteViewer({
     const dx = Math.sign(e.deltaX);
     const dy = Math.sign(e.deltaY) * 2;
     clientRef.current?.sendMouseScroll(dx, dy);
+  };
+
+  // Touch support for Android / tablets (tap = left click, long-press = right click, 2-finger = scroll)
+  const touchStateRef = useRef<{
+    startX: number;
+    startY: number;
+    lastY: number;
+    moved: boolean;
+    longPressTimer: number | null;
+    rightClicked: boolean;
+  }>({ startX: 0, startY: 0, lastY: 0, moved: false, longPressTimer: null, rightClicked: false });
+
+  const getTouchNorm = (touch: React.Touch, el: HTMLCanvasElement) => {
+    const rect = el.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (touch.clientY - rect.top) / rect.height)),
+    };
+  };
+
+  const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    clientRef.current?.resumeAudio();
+    if (!permissions.allow_input || e.touches.length === 0) return;
+    const ts = touchStateRef.current;
+    if (ts.longPressTimer !== null) {
+      window.clearTimeout(ts.longPressTimer);
+      ts.longPressTimer = null;
+    }
+    const t = e.touches[0];
+    ts.startX = t.clientX;
+    ts.startY = t.clientY;
+    ts.lastY = t.clientY;
+    ts.moved = false;
+    ts.rightClicked = false;
+
+    if (e.touches.length === 1) {
+      const { x, y } = getTouchNorm(t, e.currentTarget);
+      clientRef.current?.sendMouseMove(x, y);
+      ts.longPressTimer = window.setTimeout(() => {
+        if (!ts.moved) {
+          ts.rightClicked = true;
+          clientRef.current?.sendMouseButton("right", true, x, y);
+          clientRef.current?.sendMouseButton("right", false, x, y);
+        }
+      }, 480);
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (!permissions.allow_input || e.touches.length === 0) return;
+    const ts = touchStateRef.current;
+    const t = e.touches[0];
+    if (Math.hypot(t.clientX - ts.startX, t.clientY - ts.startY) > 8) {
+      ts.moved = true;
+      if (ts.longPressTimer !== null) {
+        window.clearTimeout(ts.longPressTimer);
+        ts.longPressTimer = null;
+      }
+    }
+    if (e.touches.length === 2) {
+      const dy = ts.lastY - t.clientY;
+      if (Math.abs(dy) > 12) {
+        clientRef.current?.sendMouseScroll(0, Math.sign(dy) * 2);
+        ts.lastY = t.clientY;
+      }
+      return;
+    }
+    const now = performance.now();
+    if (now - lastMoveSentRef.current < 16) return;
+    lastMoveSentRef.current = now;
+    const { x, y } = getTouchNorm(t, e.currentTarget);
+    clientRef.current?.sendMouseMove(x, y);
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    const ts = touchStateRef.current;
+    if (ts.longPressTimer !== null) {
+      window.clearTimeout(ts.longPressTimer);
+      ts.longPressTimer = null;
+    }
+    if (!permissions.allow_input || ts.rightClicked || ts.moved) return;
+    const t = e.changedTouches[0];
+    if (!t) return;
+    const { x, y } = getTouchNorm(t, e.currentTarget);
+    clientRef.current?.sendMouseButton("left", true, x, y);
+    clientRef.current?.sendMouseButton("left", false, x, y);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -733,7 +855,7 @@ export function RemoteViewer({
             className="btn btn-danger btn-sm"
             onClick={() => {
               clientRef.current?.disconnect();
-              onExit();
+              onExit(`Desconectado de ${hostName}`);
             }}
           >
             <PhoneOff size={14} />
@@ -832,10 +954,14 @@ export function RemoteViewer({
         <canvas
           ref={canvasRef}
           className="viewer-canvas"
+          style={{ touchAction: "none" }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
           onWheel={handleWheel}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
           onContextMenu={(e) => e.preventDefault()}
         />
 
