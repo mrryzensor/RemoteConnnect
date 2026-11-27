@@ -150,7 +150,12 @@ pub enum SessionMessage {
         quality: u8,
         display_index: usize,
         scale: f32,
+        #[serde(default)]
+        bitrate_kbps: u32,
     },
+
+    /// Viewer requests an immediate H.264 IDR keyframe.
+    RequestKeyframe,
 
     /// Mouse movement (normalized 0.0..=1.0 coordinates).
     MouseMove { x: f64, y: f64 },

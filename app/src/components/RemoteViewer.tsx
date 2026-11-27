@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Activity,
   Circle,
   Clipboard,
   Download,
@@ -15,6 +16,7 @@ import {
   Volume2,
   VolumeX,
   X,
+  Zap,
 } from "lucide-react";
 import {
   DEFAULT_PERMISSIONS,
@@ -63,10 +65,12 @@ export function RemoteViewer({
     ...DEFAULT_PERMISSIONS,
   });
   const [selectedDisplay, setSelectedDisplay] = useState(0);
-  const [fps, setFps] = useState(20);
-  const [quality, setQuality] = useState(65);
-  const [scale, setScale] = useState(0.85);
+  const [fps, setFps] = useState(30);
+  const [bitrateKbps, setBitrateKbps] = useState(2500);
+  const [scale, setScale] = useState(1.0);
   const [liveFps, setLiveFps] = useState(0);
+  const [liveKbps, setLiveKbps] = useState(0);
+  const [rttMs, setRttMs] = useState<number | null>(null);
   const [audioMuted, setAudioMuted] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -95,9 +99,12 @@ export function RemoteViewer({
 
   useEffect(() => {
     let framesInSecond = 0;
-    const fpsTimer = window.setInterval(() => {
+    let bytesInSecond = 0;
+    const statsTimer = window.setInterval(() => {
       setLiveFps(framesInSecond);
+      setLiveKbps(Math.round((bytesInSecond * 8) / 1000));
       framesInSecond = 0;
+      bytesInSecond = 0;
     }, 1000);
 
     const client = new RemoteViewerClient({
@@ -111,22 +118,28 @@ export function RemoteViewer({
         setPermissions(info.permissions);
         stageRef.current?.focus();
       },
-      onFrame: (bitmap, width, height) => {
+      onVideoFrame: (frame: VideoFrame) => {
         framesInSecond++;
         const canvas = canvasRef.current;
         if (!canvas) {
-          bitmap.close();
+          frame.close();
           return;
         }
-        if (canvas.width !== width || canvas.height !== height) {
-          canvas.width = width;
-          canvas.height = height;
+        const w = frame.displayWidth;
+        const h = frame.displayHeight;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
         }
         const ctx = canvas.getContext("2d");
         if (ctx) {
-          ctx.drawImage(bitmap, 0, 0);
+          ctx.drawImage(frame, 0, 0, w, h);
         }
-        bitmap.close();
+        frame.close();
+      },
+      onMetrics: (m) => {
+        if (m.rttMs !== undefined) setRttMs(m.rttMs);
+        if (m.bytesReceived !== undefined) bytesInSecond += m.bytesReceived;
       },
       onClipboard: (text) => {
         if (navigator.clipboard?.writeText) {
@@ -168,7 +181,7 @@ export function RemoteViewer({
     });
 
     return () => {
-      window.clearInterval(fpsTimer);
+      window.clearInterval(statsTimer);
       if (recorderRef.current && recorderRef.current.state !== "inactive") {
         recorderRef.current.stop();
       }
@@ -251,17 +264,17 @@ export function RemoteViewer({
 
   const applyStreamConfig = (
     nextFps: number,
-    nextQuality: number,
+    nextBitrateKbps: number,
     nextDisplay: number,
     nextScale: number
   ) => {
     setFps(nextFps);
-    setQuality(nextQuality);
+    setBitrateKbps(nextBitrateKbps);
     setSelectedDisplay(nextDisplay);
     setScale(nextScale);
     clientRef.current?.sendStreamConfig(
       nextFps,
-      nextQuality,
+      nextBitrateKbps,
       nextDisplay,
       nextScale
     );
@@ -283,7 +296,7 @@ export function RemoteViewer({
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!permissions.allow_input) return;
     const now = performance.now();
-    if (now - lastMoveSentRef.current < 25) return;
+    if (now - lastMoveSentRef.current < 16) return; // ~60 Hz ultra-responsive mouse
     lastMoveSentRef.current = now;
     const { x, y } = getNormalizedCoords(e);
     clientRef.current?.sendMouseMove(x, y);
@@ -419,8 +432,12 @@ export function RemoteViewer({
           <Monitor size={18} color="var(--accent)" />
           <strong style={{ fontSize: 14 }}>{hostName}</strong>
           <span className="viewer-badge">
-            <Lock size={12} />
-            E2E AES-256
+            <Zap size={11} />
+            H.264 HW
+          </span>
+          <span className="viewer-badge">
+            <Lock size={11} />
+            E2E
           </span>
           {!permissions.allow_input && (
             <span
@@ -430,8 +447,24 @@ export function RemoteViewer({
               Solo lectura
             </span>
           )}
-          <span style={{ fontSize: 12, color: "var(--text-muted)", fontFamily: "JetBrains Mono, monospace" }}>
-            {liveFps} FPS
+          <span
+            style={{
+              fontSize: 11.5,
+              color: "var(--text-muted)",
+              fontFamily: "JetBrains Mono, monospace",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
+            <span>{liveFps} FPS</span>
+            <span>{liveKbps} kbps</span>
+            {rttMs !== null && (
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+                <Activity size={11} />
+                {rttMs} ms
+              </span>
+            )}
           </span>
         </div>
 
@@ -440,7 +473,7 @@ export function RemoteViewer({
             <select
               value={selectedDisplay}
               onChange={(e) =>
-                applyStreamConfig(fps, quality, Number(e.target.value), scale)
+                applyStreamConfig(fps, bitrateKbps, Number(e.target.value), scale)
               }
               style={{ padding: "5px 9px", fontSize: 12 }}
             >
@@ -488,7 +521,7 @@ export function RemoteViewer({
           <button
             className="btn btn-secondary btn-sm"
             onClick={() => setShowSettings((s) => !s)}
-            title="Calidad y FPS"
+            title="Calidad, Bitrate H.264 y FPS"
           >
             <Sliders size={14} />
             Calidad
@@ -549,25 +582,47 @@ export function RemoteViewer({
 
       {showSettings && (
         <div className="viewer-settings-bar">
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => applyStreamConfig(60, 2000, selectedDisplay, 0.75)}
+            >
+              Ultra Fluido (60 FPS)
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => applyStreamConfig(30, 2500, selectedDisplay, 1.0)}
+            >
+              Equilibrado (30 FPS)
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => applyStreamConfig(30, 5500, selectedDisplay, 1.0)}
+            >
+              Alta Nitidez (5.5 Mbps)
+            </button>
+          </div>
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
             FPS ({fps}):
             <input
               type="range"
-              min={5}
-              max={30}
+              min={10}
+              max={60}
+              step={5}
               value={fps}
               onChange={(e) =>
-                applyStreamConfig(Number(e.target.value), quality, selectedDisplay, scale)
+                applyStreamConfig(Number(e.target.value), bitrateKbps, selectedDisplay, scale)
               }
             />
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            Calidad JPEG ({quality}%):
+            Bitrate H.264 ({(bitrateKbps / 1000).toFixed(1)} Mbps):
             <input
               type="range"
-              min={25}
-              max={92}
-              value={quality}
+              min={500}
+              max={8000}
+              step={250}
+              value={bitrateKbps}
               onChange={(e) =>
                 applyStreamConfig(fps, Number(e.target.value), selectedDisplay, scale)
               }
@@ -577,14 +632,14 @@ export function RemoteViewer({
             Escala ({Math.round(scale * 100)}%):
             <input
               type="range"
-              min={40}
+              min={50}
               max={100}
               step={5}
               value={Math.round(scale * 100)}
               onChange={(e) =>
                 applyStreamConfig(
                   fps,
-                  quality,
+                  bitrateKbps,
                   selectedDisplay,
                   Number(e.target.value) / 100
                 )

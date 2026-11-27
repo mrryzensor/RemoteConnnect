@@ -6,14 +6,14 @@ pub mod input;
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use remoteconnect_protocol::{
-    E2eSession, EphemeralKeyPair, SessionMessage, SessionPermissions, SignalMessage,
+    E2eSession, EphemeralKeyPair, MouseBtn, SessionMessage, SessionPermissions, SignalMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -21,15 +21,15 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 
 use crate::audio::spawn_audio_capture;
-use crate::capture::{capture_frame_jpeg, get_display_bounds, list_displays};
+use crate::capture::{get_display_bounds, list_displays, DisplayBounds, H264ScreenCapturer};
 use crate::clipboard::{
     get_clipboard_files, get_clipboard_text, set_clipboard_files, set_clipboard_text,
 };
 use crate::files::{list_directory, prepare_file_download, UploadManager};
 use crate::input::InputController;
 
-pub const PACKET_VIDEO_JPEG: u8 = 0x01;
 pub const PACKET_AUDIO_PCM16: u8 = 0x02;
+pub const PACKET_VIDEO_H264: u8 = 0x04;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -152,22 +152,93 @@ impl AgentHandle {
     }
 }
 
-struct StreamSettings {
-    fps: AtomicU8,
-    quality: AtomicU8,
-    display_index: AtomicUsize,
-    scale_x100: AtomicU8,
-    active: Arc<AtomicBool>,
+/// Non-blocking input actions dispatched to a dedicated OS thread.
+enum InputAction {
+    MouseMove {
+        x: f64,
+        y: f64,
+        bounds: DisplayBounds,
+    },
+    MouseButton {
+        button: MouseBtn,
+        pressed: bool,
+        x: f64,
+        y: f64,
+        bounds: DisplayBounds,
+    },
+    MouseScroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    KeyEvent {
+        code: String,
+        key: String,
+        pressed: bool,
+    },
+    TriggerPaste,
 }
 
-impl Default for StreamSettings {
-    fn default() -> Self {
+fn spawn_input_worker() -> std::sync::mpsc::Sender<InputAction> {
+    let (tx, rx) = std::sync::mpsc::channel::<InputAction>();
+    std::thread::spawn(move || {
+        let Ok(mut ctrl) = InputController::new() else {
+            warn!("Failed to initialize InputController on dedicated thread");
+            return;
+        };
+        while let Ok(action) = rx.recv() {
+            match action {
+                InputAction::MouseMove { x, y, bounds } => ctrl.move_mouse(x, y, bounds),
+                InputAction::MouseButton {
+                    button,
+                    pressed,
+                    x,
+                    y,
+                    bounds,
+                } => ctrl.mouse_button(button, pressed, x, y, bounds),
+                InputAction::MouseScroll { delta_x, delta_y } => {
+                    ctrl.mouse_scroll(delta_x, delta_y)
+                }
+                InputAction::KeyEvent { code, key, pressed } => {
+                    ctrl.key_event(&code, &key, pressed)
+                }
+                InputAction::TriggerPaste => ctrl.trigger_paste(),
+            }
+        }
+    });
+    tx
+}
+
+struct StreamSettings {
+    fps: AtomicU8,
+    bitrate_kbps: AtomicU32,
+    display_index: AtomicUsize,
+    scale_x100: AtomicU8,
+    force_keyframe: AtomicBool,
+    active: Arc<AtomicBool>,
+    cached_bounds: Mutex<DisplayBounds>,
+}
+
+impl StreamSettings {
+    fn new() -> Self {
+        let initial_bounds = get_display_bounds(0).unwrap_or_default();
         Self {
-            fps: AtomicU8::new(20),
-            quality: AtomicU8::new(65),
+            fps: AtomicU8::new(30),
+            bitrate_kbps: AtomicU32::new(2500),
             display_index: AtomicUsize::new(0),
-            scale_x100: AtomicU8::new(85),
+            scale_x100: AtomicU8::new(100),
+            force_keyframe: AtomicBool::new(true),
             active: Arc::new(AtomicBool::new(true)),
+            cached_bounds: Mutex::new(initial_bounds),
+        }
+    }
+
+    fn bounds(&self) -> DisplayBounds {
+        *self.cached_bounds.lock().unwrap()
+    }
+
+    fn refresh_bounds(&self, display_index: usize) {
+        if let Ok(b) = get_display_bounds(display_index) {
+            *self.cached_bounds.lock().unwrap() = b;
         }
     }
 }
@@ -262,10 +333,24 @@ async fn handle_connection(
     cmd_rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
 ) -> bool {
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    // High-priority control/input/audio channel
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    // Bounded video channel (capacity 2) to eliminate bufferbloat & queuing latency
+    let (video_tx, mut video_rx) = mpsc::channel::<WsMessage>(2);
 
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                m = out_rx.recv() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                v = video_rx.recv() => match v {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
@@ -283,7 +368,7 @@ async fn handle_connection(
 
     let mut sessions: HashMap<String, RunningSession> = HashMap::new();
     let mut pending: HashMap<String, PendingApproval> = HashMap::new();
-    let input_ctrl = Arc::new(Mutex::new(InputController::new().ok()));
+    let input_tx = spawn_input_worker();
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
     let mut stop_requested = false;
@@ -337,6 +422,7 @@ async fn handle_connection(
                                     &req.viewer_public_key,
                                     permissions,
                                     &out_tx,
+                                    &video_tx,
                                     event_tx,
                                     &mut sessions,
                                 );
@@ -393,6 +479,7 @@ async fn handle_connection(
                                     &viewer_public_key,
                                     config.default_permissions,
                                     &out_tx,
+                                    &video_tx,
                                     event_tx,
                                     &mut sessions,
                                 );
@@ -427,7 +514,7 @@ async fn handle_connection(
                                             &session_id,
                                             smsg,
                                             sess,
-                                            &input_ctrl,
+                                            &input_tx,
                                             &out_tx,
                                         );
                                     }
@@ -481,12 +568,14 @@ async fn handle_connection(
     stop_requested
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_session(
     session_id: String,
     viewer_name: String,
     viewer_public_key: &str,
     permissions: SessionPermissions,
     out_tx: &mpsc::UnboundedSender<WsMessage>,
+    video_tx: &mpsc::Sender<WsMessage>,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     sessions: &mut HashMap<String, RunningSession>,
 ) {
@@ -524,7 +613,7 @@ fn start_session(
         },
     );
 
-    let settings = Arc::new(StreamSettings::default());
+    let settings = Arc::new(StreamSettings::new());
     let last_clipboard_text = Arc::new(Mutex::new(get_clipboard_text().unwrap_or_default()));
     let initial_files: Vec<String> = get_clipboard_files()
         .into_iter()
@@ -533,7 +622,7 @@ fn start_session(
     let last_clipboard_files = Arc::new(Mutex::new(initial_files));
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
 
-    // Spawn remote audio capture & streaming task if permitted
+    // 1. Spawn remote audio capture & streaming task if permitted
     if permissions.allow_audio {
         let sid = session_id.clone();
         let e2e = e2e.clone();
@@ -546,7 +635,6 @@ fn start_session(
                 if !active.load(Ordering::Relaxed) {
                     break;
                 }
-                // Plaintext: [1B type=0x02][4B BE sample_rate][2B BE channels][i16 LE PCM...]
                 let mut plain = Vec::with_capacity(7 + chunk.pcm_i16_le.len());
                 plain.push(PACKET_AUDIO_PCM16);
                 plain.extend_from_slice(&chunk.sample_rate.to_be_bytes());
@@ -565,8 +653,78 @@ fn start_session(
         });
     }
 
-    // Spawn screen capture & clipboard polling task
+    // 2. Spawn dedicated OS thread for H.264 capture + encoding (zero bufferbloat!)
     {
+        let sid = session_id.clone();
+        let e2e = e2e.clone();
+        let settings = settings.clone();
+        let video_tx = video_tx.clone();
+
+        std::thread::spawn(move || {
+            let mut capturer = H264ScreenCapturer::new(0);
+            let session_start = Instant::now();
+
+            while settings.active.load(Ordering::Relaxed) {
+                // Backpressure: if network hasn't drained previous frame, wait briefly before encoding
+                if video_tx.capacity() == 0 {
+                    std::thread::sleep(Duration::from_millis(4));
+                    continue;
+                }
+
+                let frame_start = Instant::now();
+                let fps = settings.fps.load(Ordering::Relaxed).clamp(5, 60);
+                let bitrate_kbps = settings.bitrate_kbps.load(Ordering::Relaxed);
+                let display_idx = settings.display_index.load(Ordering::Relaxed);
+                let scale = (settings.scale_x100.load(Ordering::Relaxed) as f32) / 100.0;
+                let force_kf = settings.force_keyframe.swap(false, Ordering::AcqRel);
+
+                match capturer.capture_and_encode(
+                    display_idx,
+                    scale,
+                    bitrate_kbps,
+                    fps,
+                    force_kf,
+                ) {
+                    Ok(Some(encoded)) => {
+                        let ts_ms = session_start.elapsed().as_millis() as u32;
+                        // Plaintext: [0x04][1B is_keyframe][4B BE w][4B BE h][4B BE ts_ms][H.264 Annex-B]
+                        let mut plain = Vec::with_capacity(14 + encoded.h264_annex_b.len());
+                        plain.push(PACKET_VIDEO_H264);
+                        plain.push(if encoded.is_keyframe { 1 } else { 0 });
+                        plain.extend_from_slice(&encoded.width.to_be_bytes());
+                        plain.extend_from_slice(&encoded.height.to_be_bytes());
+                        plain.extend_from_slice(&ts_ms.to_be_bytes());
+                        plain.extend_from_slice(&encoded.h264_annex_b);
+
+                        if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
+                            let mut packet = Vec::with_capacity(36 + encrypted.len());
+                            packet.extend_from_slice(sid.as_bytes());
+                            packet.extend_from_slice(&encrypted);
+                            if video_tx.blocking_send(WsMessage::Binary(packet.into())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Screen unchanged — zero bytes transmitted!
+                    }
+                    Err(e) => {
+                        warn!("Capture/encode error: {}", e);
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+
+                let budget = Duration::from_millis(1000 / (fps as u64));
+                let elapsed = frame_start.elapsed();
+                if elapsed < budget {
+                    std::thread::sleep(budget - elapsed);
+                }
+            }
+        });
+    }
+
+    // 3. Lightweight clipboard polling task (1s interval, completely decoupled from video)
+    if permissions.allow_clipboard {
         let sid = session_id.clone();
         let e2e = e2e.clone();
         let settings = settings.clone();
@@ -575,84 +733,45 @@ fn start_session(
         let last_cb_files = last_clipboard_files.clone();
 
         tokio::spawn(async move {
-            let mut last_cb_check = Instant::now();
+            let mut interval = tokio::time::interval(Duration::from_millis(1000));
             loop {
-                if !settings.active.load(Ordering::Relaxed) || stop_rx.try_recv().is_ok() {
-                    break;
-                }
-
-                let start = Instant::now();
-                let fps = settings.fps.load(Ordering::Relaxed).clamp(1, 30);
-                let quality = settings.quality.load(Ordering::Relaxed);
-                let display_idx = settings.display_index.load(Ordering::Relaxed);
-                let scale = (settings.scale_x100.load(Ordering::Relaxed) as f32) / 100.0;
-
-                let cap_res = tokio::task::spawn_blocking(move || {
-                    capture_frame_jpeg(display_idx, scale, quality)
-                })
-                .await;
-
-                if let Ok(Ok((w, h, jpeg))) = cap_res {
-                    // Plaintext: [1B type=0x01][4B BE width][4B BE height][JPEG bytes]
-                    let mut plain = Vec::with_capacity(9 + jpeg.len());
-                    plain.push(PACKET_VIDEO_JPEG);
-                    plain.extend_from_slice(&w.to_be_bytes());
-                    plain.extend_from_slice(&h.to_be_bytes());
-                    plain.extend_from_slice(&jpeg);
-
-                    if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
-                        let mut packet = Vec::with_capacity(36 + encrypted.len());
-                        packet.extend_from_slice(sid.as_bytes());
-                        packet.extend_from_slice(&encrypted);
-                        if out_tx.send(WsMessage::Binary(packet.into())).is_err() {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = interval.tick() => {
+                        if !settings.active.load(Ordering::Relaxed) {
                             break;
                         }
-                    }
-                }
-
-                // Poll host clipboard (text & CF_HDROP files) every 1.0s
-                if permissions.allow_clipboard && last_cb_check.elapsed() >= Duration::from_millis(1000) {
-                    last_cb_check = Instant::now();
-
-                    // 1. Check copied files (Ctrl+C in Explorer)
-                    if permissions.allow_file_transfer {
-                        let files = get_clipboard_files();
-                        if !files.is_empty() {
-                            let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-                            let mut guard = last_cb_files.lock().unwrap();
-                            if *guard != paths {
-                                *guard = paths;
+                        if permissions.allow_file_transfer {
+                            let files = get_clipboard_files();
+                            if !files.is_empty() {
+                                let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                                let mut guard = last_cb_files.lock().unwrap();
+                                if *guard != paths {
+                                    *guard = paths;
+                                    drop(guard);
+                                    send_encrypted_session_msg(
+                                        &out_tx,
+                                        &sid,
+                                        &e2e,
+                                        &SessionMessage::ClipboardFilesAvailable { files },
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(current) = get_clipboard_text() {
+                            let mut guard = last_cb_text.lock().unwrap();
+                            if !current.is_empty() && *guard != current {
+                                *guard = current.clone();
                                 drop(guard);
                                 send_encrypted_session_msg(
                                     &out_tx,
                                     &sid,
                                     &e2e,
-                                    &SessionMessage::ClipboardFilesAvailable { files },
+                                    &SessionMessage::ClipboardSync { text: current },
                                 );
                             }
                         }
                     }
-
-                    // 2. Check copied text
-                    if let Some(current) = get_clipboard_text() {
-                        let mut guard = last_cb_text.lock().unwrap();
-                        if !current.is_empty() && *guard != current {
-                            *guard = current.clone();
-                            drop(guard);
-                            send_encrypted_session_msg(
-                                &out_tx,
-                                &sid,
-                                &e2e,
-                                &SessionMessage::ClipboardSync { text: current },
-                            );
-                        }
-                    }
-                }
-
-                let frame_budget = Duration::from_millis(1000 / (fps as u64));
-                let elapsed = start.elapsed();
-                if elapsed < frame_budget {
-                    tokio::time::sleep(frame_budget - elapsed).await;
                 }
             }
         });
@@ -681,7 +800,7 @@ fn handle_session_message(
     session_id: &str,
     msg: SessionMessage,
     sess: &RunningSession,
-    input_ctrl: &Arc<Mutex<Option<InputController>>>,
+    input_tx: &std::sync::mpsc::Sender<InputAction>,
     out_tx: &mpsc::UnboundedSender<WsMessage>,
 ) {
     match msg {
@@ -690,32 +809,42 @@ fn handle_session_message(
             quality,
             display_index,
             scale,
+            bitrate_kbps,
         } => {
-            sess.settings.fps.store(fps.clamp(1, 30), Ordering::Relaxed);
+            let prev_disp = sess.settings.display_index.swap(display_index, Ordering::Relaxed);
+            if prev_disp != display_index {
+                sess.settings.refresh_bounds(display_index);
+                sess.settings.force_keyframe.store(true, Ordering::Release);
+            }
+            sess.settings.fps.store(fps.clamp(5, 60), Ordering::Relaxed);
+            let target_bitrate = if bitrate_kbps > 0 {
+                bitrate_kbps
+            } else {
+                // Map legacy quality 25..95 -> 600..6000 kbps
+                600 + ((quality.clamp(20, 95) as u32) * 55)
+            };
             sess.settings
-                .quality
-                .store(quality.clamp(20, 95), Ordering::Relaxed);
-            sess.settings
-                .display_index
-                .store(display_index, Ordering::Relaxed);
+                .bitrate_kbps
+                .store(target_bitrate.clamp(400, 12_000), Ordering::Relaxed);
             sess.settings.scale_x100.store(
-                (scale.clamp(0.3, 1.0) * 100.0).round() as u8,
+                (scale.clamp(0.35, 1.0) * 100.0).round() as u8,
                 Ordering::Relaxed,
             );
+        }
+
+        SessionMessage::RequestKeyframe => {
+            sess.settings.force_keyframe.store(true, Ordering::Release);
         }
 
         SessionMessage::MouseMove { x, y } => {
             if !sess.permissions.allow_input {
                 return;
             }
-            let disp = sess.settings.display_index.load(Ordering::Relaxed);
-            if let Ok(bounds) = get_display_bounds(disp) {
-                if let Ok(mut guard) = input_ctrl.lock() {
-                    if let Some(ctrl) = guard.as_mut() {
-                        ctrl.move_mouse(x, y, bounds);
-                    }
-                }
-            }
+            let _ = input_tx.send(InputAction::MouseMove {
+                x,
+                y,
+                bounds: sess.settings.bounds(),
+            });
         }
 
         SessionMessage::MouseButton {
@@ -727,36 +856,27 @@ fn handle_session_message(
             if !sess.permissions.allow_input {
                 return;
             }
-            let disp = sess.settings.display_index.load(Ordering::Relaxed);
-            if let Ok(bounds) = get_display_bounds(disp) {
-                if let Ok(mut guard) = input_ctrl.lock() {
-                    if let Some(ctrl) = guard.as_mut() {
-                        ctrl.mouse_button(button, pressed, x, y, bounds);
-                    }
-                }
-            }
+            let _ = input_tx.send(InputAction::MouseButton {
+                button,
+                pressed,
+                x,
+                y,
+                bounds: sess.settings.bounds(),
+            });
         }
 
         SessionMessage::MouseScroll { delta_x, delta_y } => {
             if !sess.permissions.allow_input {
                 return;
             }
-            if let Ok(mut guard) = input_ctrl.lock() {
-                if let Some(ctrl) = guard.as_mut() {
-                    ctrl.mouse_scroll(delta_x, delta_y);
-                }
-            }
+            let _ = input_tx.send(InputAction::MouseScroll { delta_x, delta_y });
         }
 
         SessionMessage::KeyEvent { code, key, pressed } => {
             if !sess.permissions.allow_input {
                 return;
             }
-            if let Ok(mut guard) = input_ctrl.lock() {
-                if let Some(ctrl) = guard.as_mut() {
-                    ctrl.key_event(&code, &key, pressed);
-                }
-            }
+            let _ = input_tx.send(InputAction::KeyEvent { code, key, pressed });
         }
 
         SessionMessage::ClipboardSync { text } => {
@@ -779,7 +899,10 @@ fn handle_session_message(
                         current_path: String::new(),
                         parent_path: None,
                         entries: vec![],
-                        error: Some("Permiso de transferencia de archivos deshabilitado por el anfitrión".into()),
+                        error: Some(
+                            "Permiso de transferencia de archivos deshabilitado por el anfitrión"
+                                .into(),
+                        ),
                     },
                 );
                 return;
@@ -861,13 +984,9 @@ fn handle_session_message(
                 if let Ok(mut guard) = sess.last_clipboard_files.lock() {
                     *guard = vec![path_str.clone()];
                 }
-                let placed = set_clipboard_files(&[path_str.clone()]);
+                let placed = set_clipboard_files(&[path_str]);
                 if placed && paste_after_receive && sess.permissions.allow_input {
-                    if let Ok(mut guard) = input_ctrl.lock() {
-                        if let Some(ctrl) = guard.as_mut() {
-                            ctrl.trigger_paste();
-                        }
-                    }
+                    let _ = input_tx.send(InputAction::TriggerPaste);
                 }
             }
 

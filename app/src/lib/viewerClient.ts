@@ -7,8 +7,8 @@ import {
 } from "../types";
 import { base64ToBytes, bytesToBase64, E2eKeyPair, E2eSession } from "./crypto";
 
-const PACKET_VIDEO_JPEG = 0x01;
 const PACKET_AUDIO_PCM16 = 0x02;
+const PACKET_VIDEO_H264 = 0x04;
 
 export interface ViewerCallbacks {
   onStatus: (
@@ -21,7 +21,8 @@ export interface ViewerCallbacks {
     displays: DisplayInfo[];
     permissions: SessionPermissions;
   }) => void;
-  onFrame: (bitmap: ImageBitmap, width: number, height: number) => void;
+  onVideoFrame: (frame: VideoFrame) => void;
+  onMetrics: (metrics: { rttMs?: number; bytesReceived?: number }) => void;
   onClipboard: (text: string) => void;
   onClipboardFiles: (files: ClipboardFileInfo[]) => void;
   onFileList: (data: {
@@ -47,7 +48,13 @@ export class RemoteViewerClient {
   private sessionId: string | null = null;
   private keyPair: E2eKeyPair | null = null;
   private downloads = new Map<string, PendingDownload>();
-  private decodingVideo = false;
+  private pingTimer: number | null = null;
+
+  // WebCodecs hardware-accelerated H.264 decoder
+  private videoDecoder: VideoDecoder | null = null;
+  private awaitingKeyframe = true;
+  private lastVideoW = 0;
+  private lastVideoH = 0;
 
   // WebAudio playback engine
   private audioCtx: AudioContext | null = null;
@@ -69,6 +76,52 @@ export class RemoteViewerClient {
     if (this.audioCtx && this.audioCtx.state === "suspended") {
       this.audioCtx.resume().catch(() => {});
     }
+  }
+
+  private initVideoDecoder() {
+    this.closeVideoDecoder();
+    if (typeof VideoDecoder === "undefined") {
+      this.cb.onStatus(
+        "disconnected",
+        "Este navegador no soporta WebCodecs H.264. Usa Edge, Chrome o la app de escritorio."
+      );
+      return;
+    }
+
+    const decoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        this.cb.onVideoFrame(frame);
+      },
+      error: (err) => {
+        console.warn("WebCodecs VideoDecoder error, recovering:", err);
+        this.awaitingKeyframe = true;
+        this.initVideoDecoder();
+        this.requestKeyframe();
+      },
+    });
+
+    decoder.configure({
+      codec: "avc1.420033", // H.264 Baseline Level 5.1 (Annex-B, up to 4K@60fps)
+      hardwareAcceleration: "prefer-hardware",
+      optimizeForLatency: true,
+    });
+
+    this.videoDecoder = decoder;
+    this.awaitingKeyframe = true;
+  }
+
+  private closeVideoDecoder() {
+    if (this.videoDecoder) {
+      try {
+        if (this.videoDecoder.state !== "closed") {
+          this.videoDecoder.close();
+        }
+      } catch {
+        // ignore
+      }
+      this.videoDecoder = null;
+    }
+    this.awaitingKeyframe = true;
   }
 
   async connect(params: {
@@ -99,6 +152,13 @@ export class RemoteViewerClient {
           auth_token: params.authToken || null,
         })
       );
+
+      // Measure RTT ping every 3 seconds
+      this.pingTimer = window.setInterval(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+        }
+      }, 3000);
     };
 
     ws.onmessage = async (event) => {
@@ -117,12 +177,21 @@ export class RemoteViewerClient {
       if (this.ws === ws) {
         this.ws = null;
         this.e2e = null;
+        this.closeVideoDecoder();
+        if (this.pingTimer !== null) {
+          window.clearInterval(this.pingTimer);
+          this.pingTimer = null;
+        }
         this.cb.onStatus("disconnected", "Sesión finalizada");
       }
     };
   }
 
   disconnect(reason?: string) {
+    if (this.pingTimer !== null) {
+      window.clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionId) {
       this.ws.send(
         JSON.stringify({
@@ -137,6 +206,7 @@ export class RemoteViewerClient {
       this.ws = null;
       old.close();
     }
+    this.closeVideoDecoder();
     if (this.audioCtx) {
       this.audioCtx.close().catch(() => {});
       this.audioCtx = null;
@@ -157,6 +227,14 @@ export class RemoteViewerClient {
     }
 
     switch (msg.type) {
+      case "pong": {
+        const sentTs = Number(msg.timestamp || 0);
+        if (sentTs > 0) {
+          this.cb.onMetrics({ rttMs: Math.max(1, Date.now() - sentTs) });
+        }
+        break;
+      }
+
       case "session_ready": {
         const accepted = Boolean(msg.accepted);
         if (!accepted) {
@@ -176,15 +254,21 @@ export class RemoteViewerClient {
         }
         this.sessionId = sessionId;
         this.e2e = await this.keyPair.deriveSession(hostPub, sessionId);
+        this.initVideoDecoder();
+
         const permissions: SessionPermissions =
           (msg.permissions as SessionPermissions) || { ...DEFAULT_PERMISSIONS };
-        this.cb.onStatus("connected", "Cifrado E2E AES-256-GCM activo");
+        this.cb.onStatus("connected", "H.264 HW + E2E AES-256-GCM activo");
         this.cb.onSessionReady({
           sessionId,
           hostName: (msg.host_name as string) || "Equipo Remoto",
           displays: (msg.displays as DisplayInfo[]) || [],
           permissions,
         });
+        // Send immediate ping for initial RTT reading
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+        }
         break;
       }
 
@@ -223,6 +307,8 @@ export class RemoteViewerClient {
 
   private async handleBinaryPacket(buffer: ArrayBuffer) {
     if (!this.e2e) return;
+    this.cb.onMetrics({ bytesReceived: buffer.byteLength });
+
     const bytes = new Uint8Array(buffer);
     if (bytes.length <= 36 + 28) return;
 
@@ -237,29 +323,49 @@ export class RemoteViewerClient {
 
     const packetType = plain[0];
 
-    if (packetType === PACKET_VIDEO_JPEG) {
-      if (this.decodingVideo || plain.length <= 9) return;
-      this.decodingVideo = true;
+    if (packetType === PACKET_VIDEO_H264) {
+      if (plain.length <= 14 || !this.videoDecoder || this.videoDecoder.state !== "configured") {
+        return;
+      }
+      const isKeyframe = plain[1] === 1;
+      const view = new DataView(plain.buffer, plain.byteOffset + 2, 12);
+      const width = view.getUint32(0, false);
+      const height = view.getUint32(4, false);
+      const timestampMs = view.getUint32(8, false);
+      const h264Data = plain.subarray(14);
+
+      if (width !== this.lastVideoW || height !== this.lastVideoH) {
+        this.lastVideoW = width;
+        this.lastVideoH = height;
+        if (!isKeyframe) {
+          this.awaitingKeyframe = true;
+          this.requestKeyframe();
+          return;
+        }
+      }
+
+      if (this.awaitingKeyframe) {
+        if (!isKeyframe) return;
+        this.awaitingKeyframe = false;
+      }
+
+      // Prevent decoder queue buildup for ultra-low latency
+      if (this.videoDecoder.decodeQueueSize > 3 && !isKeyframe) {
+        this.awaitingKeyframe = true;
+        this.requestKeyframe();
+        return;
+      }
+
       try {
-        const view = new DataView(plain.buffer, plain.byteOffset + 1, plain.byteLength - 1);
-        const width = view.getUint32(0, false);
-        const height = view.getUint32(4, false);
-        const jpegBytes = plain.subarray(9);
-        const blob = new Blob(
-          [
-            jpegBytes.buffer.slice(
-              jpegBytes.byteOffset,
-              jpegBytes.byteOffset + jpegBytes.byteLength
-            ) as ArrayBuffer,
-          ],
-          { type: "image/jpeg" }
-        );
-        const bitmap = await createImageBitmap(blob);
-        this.cb.onFrame(bitmap, width, height);
+        const chunk = new EncodedVideoChunk({
+          type: isKeyframe ? "key" : "delta",
+          timestamp: timestampMs * 1000, // microseconds
+          data: h264Data,
+        });
+        this.videoDecoder.decode(chunk);
       } catch {
-        // drop corrupt frame
-      } finally {
-        this.decodingVideo = false;
+        this.awaitingKeyframe = true;
+        this.requestKeyframe();
       }
     } else if (packetType === PACKET_AUDIO_PCM16) {
       if (this.audioMuted || plain.length <= 7) return;
@@ -305,7 +411,6 @@ export class RemoteViewerClient {
     }
 
     const now = this.audioCtx.currentTime;
-    // Prevent runaway latency drift if packets stalled
     if (this.nextAudioTime < now || this.nextAudioTime > now + 0.35) {
       this.nextAudioTime = now + 0.04;
     }
@@ -386,6 +491,10 @@ export class RemoteViewerClient {
     );
   }
 
+  requestKeyframe() {
+    void this.sendEncrypted({ kind: "request_keyframe" });
+  }
+
   sendMouseMove(x: number, y: number) {
     void this.sendEncrypted({ kind: "mouse_move", x, y });
   }
@@ -407,11 +516,17 @@ export class RemoteViewerClient {
     void this.sendEncrypted({ kind: "key_event", code, key, pressed });
   }
 
-  sendStreamConfig(fps: number, quality: number, displayIndex: number, scale: number) {
+  sendStreamConfig(
+    fps: number,
+    bitrateKbps: number,
+    displayIndex: number,
+    scale: number
+  ) {
     void this.sendEncrypted({
       kind: "stream_config",
       fps,
-      quality,
+      quality: 75,
+      bitrate_kbps: bitrateKbps,
       display_index: displayIndex,
       scale,
     });
@@ -467,9 +582,6 @@ export class RemoteViewerClient {
     }
   }
 
-  /**
-   * Upload a file pasted with Ctrl+V (or dragged onto viewer) and place it on the Host clipboard (CF_HDROP).
-   */
   async pasteFileToHost(file: File, pasteAfterReceive: boolean) {
     const transferId = crypto.randomUUID();
     const chunkSize = 128 * 1024;
