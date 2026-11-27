@@ -43,6 +43,13 @@ jobs:
         working-directory: app
         run: npm ci
 
+      - name: Sync version from Git tag
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.ref_name }}" -match '^v(\d+\.\d+\.\d+)$') { $Matches[1] } else { "0.1.12" }
+          (Get-Content app/src-tauri/Cargo.toml) -replace '^version = ".*"', "version = `"$tag`"" | Set-Content app/src-tauri/Cargo.toml
+          (Get-Content app/src-tauri/tauri.conf.json) -replace '"version": ".*"', "`"version`": `"$tag`"" | Set-Content app/src-tauri/tauri.conf.json
+
       - name: Build RemoteConnect Windows Portable & Installers (NSIS + MSI)
         working-directory: app
         run: npm run tauri build
@@ -95,6 +102,15 @@ jobs:
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci
+
+      - name: Sync version from Git tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            sed -i "s/^version = \".*\"/version = \"$TAG\"/" app/src-tauri/Cargo.toml
+            sed -i "s/\"version\": \".*\"/\"version\": \"$TAG\"/" app/src-tauri/tauri.conf.json
+          fi
 
       - name: Initialize & Build Android APK (Tauri 2)
         working-directory: app

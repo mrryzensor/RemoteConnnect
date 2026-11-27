@@ -7,6 +7,7 @@ import {
   Download,
   FolderOpen,
   Hand,
+  Keyboard,
   Lock,
   Maximize,
   Minimize2,
@@ -81,6 +82,15 @@ export function RemoteViewer({
       window.matchMedia?.("(pointer: coarse)").matches);
 
   const [touchMode, setTouchMode] = useState<"touch" | "cursor">("touch");
+  const [showSpecialKeys, setShowSpecialKeys] = useState<boolean>(isTouchDevice);
+  const [stickyMods, setStickyMods] = useState<{
+    ctrl: boolean;
+    shift: boolean;
+    win: boolean;
+    alt: boolean;
+    altGr: boolean;
+  }>({ ctrl: false, shift: false, win: false, alt: false, altGr: false });
+  const mobileInputRef = useRef<HTMLInputElement>(null);
   const [virtualCursor, setVirtualCursor] = useState<{ x: number; y: number }>({
     x: 0.5,
     y: 0.5,
@@ -639,6 +649,71 @@ export function RemoteViewer({
     clientRef.current?.sendKeyEvent(e.code, e.key, false);
   };
 
+  // Sticky modifier keys + special Windows keys helper for Android / touch devices
+  const MOD_MAP: Record<
+    keyof typeof stickyMods,
+    { code: string; key: string }
+  > = {
+    ctrl: { code: "ControlLeft", key: "Control" },
+    shift: { code: "ShiftLeft", key: "Shift" },
+    win: { code: "MetaLeft", key: "Meta" },
+    alt: { code: "AltLeft", key: "Alt" },
+    altGr: { code: "AltRight", key: "AltGraph" },
+  };
+
+  const toggleStickyMod = (mod: keyof typeof stickyMods) => {
+    if (!permissions.allow_input) return;
+    setStickyMods((prev) => {
+      const nextVal = !prev[mod];
+      const def = MOD_MAP[mod];
+      clientRef.current?.sendKeyEvent(def.code, def.key, nextVal);
+      return { ...prev, [mod]: nextVal };
+    });
+  };
+
+  const releaseAllStickyMods = () => {
+    setStickyMods((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      (Object.keys(MOD_MAP) as Array<keyof typeof stickyMods>).forEach((m) => {
+        if (prev[m]) {
+          changed = true;
+          next[m] = false;
+          const def = MOD_MAP[m];
+          clientRef.current?.sendKeyEvent(def.code, def.key, false);
+        }
+      });
+      return changed ? next : prev;
+    });
+  };
+
+  const tapSpecialKey = (code: string, key: string) => {
+    if (!permissions.allow_input) return;
+    clientRef.current?.resumeAudio();
+    clientRef.current?.sendKeyEvent(code, key, true);
+    clientRef.current?.sendKeyEvent(code, key, false);
+    releaseAllStickyMods();
+  };
+
+  const handleMobileTextInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    if (!val || !permissions.allow_input) return;
+    for (const ch of val) {
+      clientRef.current?.sendKeyEvent("", ch, true);
+      clientRef.current?.sendKeyEvent("", ch, false);
+    }
+    releaseAllStickyMods();
+    e.target.value = "";
+  };
+
+  const handleMobileInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!permissions.allow_input) return;
+    if (e.key === "Backspace" || e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      tapSpecialKey(e.key, e.key);
+    }
+  };
+
   const handlePaste = async (e: React.ClipboardEvent<HTMLDivElement>) => {
     if (showFiles) return;
     const files = Array.from(e.clipboardData.files || []);
@@ -834,31 +909,41 @@ export function RemoteViewer({
           )}
 
           {isTouchDevice && (
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => {
-                const next = touchMode === "touch" ? "cursor" : "touch";
-                setTouchMode(next);
-                flashToast(
-                  next === "cursor"
-                    ? "Modo Cursor (Trackpad): desliza para mover, toca para clic"
-                    : "Modo Táctil directo: toca directamente donde quieras hacer clic"
-                );
-              }}
-              title="Cambiar entre modo Táctil directo y Cursor (Trackpad)"
-            >
-              {touchMode === "cursor" ? (
-                <>
-                  <MousePointer2 size={14} color="var(--accent)" />
-                  Cursor
-                </>
-              ) : (
-                <>
-                  <Hand size={14} color="var(--accent)" />
-                  Táctil
-                </>
-              )}
-            </button>
+            <>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  const next = touchMode === "touch" ? "cursor" : "touch";
+                  setTouchMode(next);
+                  flashToast(
+                    next === "cursor"
+                      ? "Modo Cursor (Trackpad): desliza para mover, toca para clic"
+                      : "Modo Táctil directo: toca directamente donde quieras hacer clic"
+                  );
+                }}
+                title="Cambiar entre modo Táctil directo y Cursor (Trackpad)"
+              >
+                {touchMode === "cursor" ? (
+                  <>
+                    <MousePointer2 size={14} color="var(--accent)" />
+                    Cursor
+                  </>
+                ) : (
+                  <>
+                    <Hand size={14} color="var(--accent)" />
+                    Táctil
+                  </>
+                )}
+              </button>
+              <button
+                className={`btn btn-sm ${showSpecialKeys ? "btn-primary" : "btn-secondary"}`}
+                onClick={() => setShowSpecialKeys((s) => !s)}
+                title="Mostrar / ocultar barra de teclas especiales Windows"
+              >
+                <Keyboard size={14} />
+                Teclas
+              </button>
+            </>
           )}
 
           {permissions.allow_audio && (
@@ -1120,6 +1205,130 @@ export function RemoteViewer({
           </div>
         )}
       </div>
+
+      {showSpecialKeys && permissions.allow_input && (
+        <div className="special-keys-dock">
+          <input
+            ref={mobileInputRef}
+            type="text"
+            className="mobile-kbd-input"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            onChange={handleMobileTextInput}
+            onKeyDown={handleMobileInputKeyDown}
+            aria-label="Teclado virtual"
+          />
+
+          <div className="special-keys-row">
+            <button
+              className="skey-btn accent"
+              onClick={() => mobileInputRef.current?.focus()}
+            >
+              ⌨ Teclado
+            </button>
+            <button
+              className={`skey-btn ${stickyMods.ctrl ? "active" : ""}`}
+              onClick={() => toggleStickyMod("ctrl")}
+            >
+              Ctrl
+            </button>
+            <button
+              className={`skey-btn ${stickyMods.shift ? "active" : ""}`}
+              onClick={() => toggleStickyMod("shift")}
+            >
+              Shift
+            </button>
+            <button
+              className={`skey-btn ${stickyMods.win ? "active" : ""}`}
+              onClick={() => toggleStickyMod("win")}
+            >
+              Win
+            </button>
+            <button
+              className={`skey-btn ${stickyMods.alt ? "active" : ""}`}
+              onClick={() => toggleStickyMod("alt")}
+            >
+              Alt
+            </button>
+            <button
+              className={`skey-btn ${stickyMods.altGr ? "active" : ""}`}
+              onClick={() => toggleStickyMod("altGr")}
+            >
+              Alt Gr
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Escape", "Escape")}>
+              Esc
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Tab", "Tab")}>
+              Tab
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Enter", "Enter")}>
+              Enter
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Backspace", "Backspace")}>
+              ⌫
+            </button>
+          </div>
+
+          <div className="special-keys-row">
+            <button className="skey-btn" onClick={() => tapSpecialKey("ArrowLeft", "ArrowLeft")}>
+              ←
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("ArrowUp", "ArrowUp")}>
+              ↑
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("ArrowDown", "ArrowDown")}>
+              ↓
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("ArrowRight", "ArrowRight")}>
+              →
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Delete", "Delete")}>
+              Supr
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Insert", "Insert")}>
+              Insert
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Home", "Home")}>
+              Inicio
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("End", "End")}>
+              Fin
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("PageUp", "PageUp")}>
+              RePág
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("PageDown", "PageDown")}>
+              AvPág
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("PrintScreen", "PrintScreen")}>
+              Impr Pant
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("ScrollLock", "ScrollLock")}>
+              ScrLck
+            </button>
+            <button className="skey-btn" onClick={() => tapSpecialKey("Pause", "Pause")}>
+              Pausa
+            </button>
+          </div>
+
+          <div className="special-keys-row">
+            {(["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"] as const).map(
+              (fk) => (
+                <button
+                  key={fk}
+                  className="skey-btn"
+                  onClick={() => tapSpecialKey(fk, fk)}
+                >
+                  {fk}
+                </button>
+              )
+            )}
+          </div>
+        </div>
+      )}
 
       {showFiles && (
         <FileTransferModal

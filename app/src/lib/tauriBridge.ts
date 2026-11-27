@@ -244,6 +244,19 @@ export async function relaunchWithUiMode(
   }
 }
 
+export async function getAppVersion(): Promise<string> {
+  if (isTauriEnv()) {
+    return invoke<string>("get_app_version").catch(() => "0.1.12");
+  }
+  return "0.1.12";
+}
+
+export async function installWindowsUpdate(downloadUrl: string): Promise<void> {
+  if (isTauriEnv()) {
+    await invoke("install_windows_update", { downloadUrl });
+  }
+}
+
 export function serverWsToHttpBase(serverUrl: string): string | null {
   try {
     const u = new URL(serverUrl);

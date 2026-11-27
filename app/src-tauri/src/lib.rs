@@ -530,6 +530,84 @@ fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
 }
 
 #[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+async fn install_windows_update(
+    app: AppHandle,
+    download_url: String,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let url = download_url.clone();
+        let current_exe =
+            std::env::current_exe().map_err(|e| format!("No se encontró el ejecutable: {}", e))?;
+        let temp_exe = std::env::temp_dir().join("RemoteConnect-update.exe");
+        let temp_str = temp_exe.to_string_lossy().to_string();
+
+        // Download latest release binary silently using built-in Windows curl.exe
+        let dl_result = tokio::task::spawn_blocking(move || {
+            let status = std::process::Command::new("curl.exe")
+                .args(["-fsSL", "--retry", "2", "-o", &temp_str, &url])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map_err(|e| format!("Error ejecutando descarga: {}", e))?;
+            if !status.success() {
+                return Err(format!("Descarga fallida (código {:?})", status.code()));
+            }
+            let meta = fs::metadata(&temp_exe)
+                .map_err(|e| format!("Archivo descargado inválido: {}", e))?;
+            if meta.len() < 1_000_000 {
+                let _ = fs::remove_file(&temp_exe);
+                return Err("El archivo descargado es demasiado pequeño o está incompleto".into());
+            }
+
+            // Windows allows renaming a running .exe; move old aside and place new binary
+            let old_exe = current_exe.with_extension("exe.old");
+            let _ = fs::remove_file(&old_exe);
+            fs::rename(&current_exe, &old_exe)
+                .map_err(|e| format!("No se pudo reemplazar el ejecutable actual: {}", e))?;
+
+            if let Err(copy_err) = fs::copy(&temp_exe, &current_exe) {
+                // Rollback if copy fails
+                let _ = fs::rename(&old_exe, &current_exe);
+                return Err(format!("No se pudo copiar la nueva versión: {}", copy_err));
+            }
+            let _ = fs::remove_file(&temp_exe);
+            Ok(current_exe)
+        })
+        .await
+        .map_err(|e| format!("Error interno de actualización: {}", e))??;
+
+        // Stop embedded agent cleanly before launching the updated binary
+        if let Some(st) = app.try_state::<DesktopState>() {
+            if let Some(agent) = st.agent.lock().unwrap().take() {
+                agent.stop();
+            }
+        }
+
+        let mut cmd = std::process::Command::new(&dl_result);
+        if std::env::args().any(|a| a == "--background") {
+            cmd.arg("--background");
+        }
+        let _ = cmd.spawn();
+        app.exit(0);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, download_url);
+        Err("Actualización automática directa solo disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, DesktopState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
@@ -796,6 +874,16 @@ fn remove_device(state: State<'_, DesktopState>, device_id: String) -> Vec<Saved
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt::try_init();
+
+    // Clean up leftover .exe.old from a previous automatic update on Windows
+    #[cfg(target_os = "windows")]
+    if let Ok(exe) = std::env::current_exe() {
+        let old_exe = exe.with_extension("exe.old");
+        if old_exe.exists() {
+            let _ = fs::remove_file(&old_exe);
+        }
+    }
+
     #[allow(unused_mut)]
     let mut initial_cfg = AppConfig::load_or_create();
 
@@ -938,6 +1026,8 @@ pub fn run() {
 
     builder
         .invoke_handler(tauri::generate_handler![
+            get_app_version,
+            install_windows_update,
             get_config,
             get_agent_status,
             get_active_host_sessions,

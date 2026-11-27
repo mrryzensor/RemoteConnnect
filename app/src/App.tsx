@@ -39,8 +39,10 @@ import {
   disconnectHostSession,
   fetchDeviceOnlineStatus,
   getAgentStatus,
+  getAppVersion,
   getAutostart,
   getConfig,
+  installWindowsUpdate,
   isTauriEnv,
   onAgentEvent,
   regeneratePin,
@@ -135,6 +137,7 @@ function MainApp() {
   const [newDevPin, setNewDevPin] = useState("");
 
   const [toast, setToast] = useState<string | null>(null);
+  const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -236,6 +239,73 @@ function MainApp() {
   useEffect(() => {
     void setViewerMode(Boolean(activeViewer));
   }, [activeViewer]);
+
+  // Silent automatic updater: checks GitHub Releases on launch & hourly, updates without prompting
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+
+    const parseSemver = (v: string): [number, number, number] => {
+      const clean = v.replace(/^v/i, "").split("-")[0];
+      const parts = clean.split(".").map((n) => parseInt(n, 10) || 0);
+      return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+    };
+
+    const isNewer = (latest: string, current: string): boolean => {
+      const a = parseSemver(latest);
+      const b = parseSemver(current);
+      if (a[0] !== b[0]) return a[0] > b[0];
+      if (a[1] !== b[1]) return a[1] > b[1];
+      return a[2] > b[2];
+    };
+
+    const checkAndAutoUpdate = async () => {
+      try {
+        const currentVer = await getAppVersion();
+        const res = await fetch(
+          "https://api.github.com/repos/mrryzensor/RemoteConnnect/releases/latest",
+          { headers: { Accept: "application/vnd.github+json" }, cache: "no-store" }
+        );
+        if (!res.ok) return;
+        const rel = (await res.json()) as {
+          tag_name?: string;
+          assets?: Array<{ name: string; browser_download_url: string }>;
+        };
+        const tag = rel.tag_name;
+        if (!tag || !isNewer(tag, currentVer)) return;
+
+        const assets = rel.assets ?? [];
+        const isAndroid = /Android/i.test(navigator.userAgent);
+
+        if (isAndroid) {
+          const apk = assets.find((a) => a.name.toLowerCase().endsWith(".apk"));
+          if (!apk) return;
+          setUpdatingStatus(`Actualizando a ${tag}...`);
+          window.location.href = apk.browser_download_url;
+          window.setTimeout(() => setUpdatingStatus(null), 8000);
+          return;
+        }
+
+        const portable = assets.find(
+          (a) =>
+            a.name.toLowerCase().includes("portable") &&
+            a.name.toLowerCase().endsWith(".exe")
+        );
+        if (!portable) return;
+
+        setUpdatingStatus(`Actualizando a ${tag}...`);
+        await installWindowsUpdate(portable.browser_download_url);
+      } catch {
+        setUpdatingStatus(null);
+      }
+    };
+
+    const initialTimer = window.setTimeout(() => void checkAndAutoUpdate(), 2500);
+    const periodicTimer = window.setInterval(() => void checkAndAutoUpdate(), 60 * 60 * 1000);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(periodicTimer);
+    };
+  }, []);
 
   const refreshDeviceStatuses = async (
     serverUrl: string,
@@ -408,6 +478,19 @@ function MainApp() {
 
   return (
     <div className="app-shell">
+      {updatingStatus && (
+        <div className="auto-update-overlay">
+          <div className="auto-update-card">
+            <span className="auto-update-spinner" />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14 }}>{updatingStatus}</div>
+              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
+                Descargando e instalando automáticamente, por favor espera...
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <div
         className={`sidebar-backdrop ${sidebarOpen ? "open" : ""}`}
         onClick={() => setSidebarOpen(false)}

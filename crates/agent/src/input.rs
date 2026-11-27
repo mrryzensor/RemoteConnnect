@@ -89,6 +89,19 @@ fn map_key(code: &str, key: &str) -> Option<Key> {
         "Tab" => Some(Key::Tab),
         "Backspace" => Some(Key::Backspace),
         "Delete" => Some(Key::Delete),
+        "Insert" => Some(Key::Insert),
+        "PrintScreen" => Some(Key::PrintScr),
+        "Pause" => Some(Key::Pause),
+        "ScrollLock" => {
+            #[cfg(target_os = "windows")]
+            {
+                Some(Key::Scroll)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Some(Key::ScrollLock)
+            }
+        }
         "Escape" => Some(Key::Escape),
         "Space" => Some(Key::Space),
         "ArrowUp" => Some(Key::UpArrow),
@@ -101,7 +114,17 @@ fn map_key(code: &str, key: &str) -> Option<Key> {
         "PageDown" => Some(Key::PageDown),
         "ShiftLeft" | "ShiftRight" => Some(Key::Shift),
         "ControlLeft" | "ControlRight" => Some(Key::Control),
-        "AltLeft" | "AltRight" => Some(Key::Alt),
+        "AltLeft" => Some(Key::Alt),
+        "AltRight" => {
+            #[cfg(target_os = "windows")]
+            {
+                Some(Key::RMenu)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Some(Key::Alt)
+            }
+        }
         "MetaLeft" | "MetaRight" => Some(Key::Meta),
         "CapsLock" => Some(Key::CapsLock),
         "F1" => Some(Key::F1),
