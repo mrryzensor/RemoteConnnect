@@ -150,7 +150,7 @@ export function RemoteViewer({
       },
       onClipboard: (text) => {
         if (navigator.clipboard?.writeText) {
-          navigator.clipboard.writeText(text).catch(() => {});
+          navigator.clipboard.writeText(text).catch(() => { });
         }
       },
       onClipboardFiles: (files) => {
@@ -193,9 +193,9 @@ export function RemoteViewer({
         window.clearTimeout(hideToolbarTimerRef.current);
       }
       if (isTauriEnv()) {
-        getCurrentWindow().setFullscreen(false).catch(() => {});
+        getCurrentWindow().setFullscreen(false).catch(() => { });
       } else if (document.fullscreenElement) {
-        document.exitFullscreen().catch(() => {});
+        document.exitFullscreen().catch(() => { });
       }
       if (recorderRef.current && recorderRef.current.state !== "inactive") {
         recorderRef.current.stop();
@@ -252,8 +252,8 @@ export function RemoteViewer({
       const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
         ? "video/webm;codecs=vp9,opus"
         : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
-        ? "video/webm;codecs=vp8,opus"
-        : "video/webm";
+          ? "video/webm;codecs=vp8,opus"
+          : "video/webm";
 
       const recorder = new MediaRecorder(combined, { mimeType });
       recordedChunksRef.current = [];
@@ -455,17 +455,17 @@ export function RemoteViewer({
       } catch {
         // fallback to DOM fullscreen
         if (next) {
-          await document.documentElement.requestFullscreen().catch(() => {});
+          await document.documentElement.requestFullscreen().catch(() => { });
         } else {
-          await document.exitFullscreen().catch(() => {});
+          await document.exitFullscreen().catch(() => { });
         }
         setIsFullscreen(next);
       }
     } else {
       if (next) {
-        await document.documentElement.requestFullscreen().catch(() => {});
+        await document.documentElement.requestFullscreen().catch(() => { });
       } else {
-        await document.exitFullscreen().catch(() => {});
+        await document.exitFullscreen().catch(() => { });
       }
     }
   };

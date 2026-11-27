@@ -78,7 +78,7 @@ export class RemoteViewerClient {
     }
   }
 
-  private initVideoDecoder() {
+  private async initVideoDecoder() {
     this.closeVideoDecoder();
     if (typeof VideoDecoder === "undefined") {
       this.cb.onStatus(
@@ -88,6 +88,54 @@ export class RemoteViewerClient {
       return;
     }
 
+    // Probe supported Annex-B H.264 configs (hardware first, then software fallback)
+    const candidates: Array<VideoDecoderConfig & { avc?: { format: "annexb" | "avc" } }> = [
+      {
+        codec: "avc1.42E033",
+        avc: { format: "annexb" },
+        hardwareAcceleration: "prefer-hardware",
+        optimizeForLatency: true,
+      },
+      {
+        codec: "avc1.420033",
+        avc: { format: "annexb" },
+        hardwareAcceleration: "prefer-hardware",
+        optimizeForLatency: true,
+      },
+      {
+        codec: "avc1.42E02A",
+        avc: { format: "annexb" },
+        hardwareAcceleration: "no-preference",
+        optimizeForLatency: true,
+      },
+      {
+        codec: "avc1.42001F",
+        avc: { format: "annexb" },
+        hardwareAcceleration: "prefer-software",
+        optimizeForLatency: true,
+      },
+    ];
+
+    let chosen: VideoDecoderConfig | null = null;
+    for (const cfg of candidates) {
+      try {
+        const res = await VideoDecoder.isConfigSupported(cfg);
+        if (res.supported) {
+          chosen = cfg;
+          break;
+        }
+      } catch {
+        // try next candidate
+      }
+    }
+
+    if (!chosen) {
+      chosen = {
+        codec: "avc1.42001F",
+        optimizeForLatency: true,
+      };
+    }
+
     const decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
         this.cb.onVideoFrame(frame);
@@ -95,17 +143,11 @@ export class RemoteViewerClient {
       error: (err) => {
         console.warn("WebCodecs VideoDecoder error, recovering:", err);
         this.awaitingKeyframe = true;
-        this.initVideoDecoder();
-        this.requestKeyframe();
+        void this.initVideoDecoder().then(() => this.requestKeyframe());
       },
     });
 
-    decoder.configure({
-      codec: "avc1.420033", // H.264 Baseline Level 5.1 (Annex-B, up to 4K@60fps)
-      hardwareAcceleration: "prefer-hardware",
-      optimizeForLatency: true,
-    });
-
+    decoder.configure(chosen);
     this.videoDecoder = decoder;
     this.awaitingKeyframe = true;
   }
@@ -254,7 +296,8 @@ export class RemoteViewerClient {
         }
         this.sessionId = sessionId;
         this.e2e = await this.keyPair.deriveSession(hostPub, sessionId);
-        this.initVideoDecoder();
+        await this.initVideoDecoder();
+        this.requestKeyframe();
 
         const permissions: SessionPermissions =
           (msg.permissions as SessionPermissions) || { ...DEFAULT_PERMISSIONS };

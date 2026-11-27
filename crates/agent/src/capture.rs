@@ -274,3 +274,34 @@ fn fast_resize_rgba_nearest(
 fn frames_equal_fast(a: &[u8], b: &[u8]) -> bool {
     a == b
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openh264_emits_annex_b_sps_pps_idr() {
+        let w = 640usize;
+        let h = 360usize;
+        let rgba = vec![128u8; w * h * 4];
+        let mut yuv = YUVBuffer::new(w, h);
+        yuv.read_rgb(RgbaSliceU8::new(&rgba, (w, h)));
+
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .set_bitrate_bps(1_500_000)
+            .max_frame_rate(30.0)
+            .enable_skip_frame(false);
+        let mut enc = Encoder::with_api_config(OpenH264API::from_source(), config).unwrap();
+        enc.force_intra_frame();
+        let bs = enc.encode(&yuv).unwrap();
+        let bytes = bs.to_vec();
+        assert!(!bytes.is_empty());
+        assert!(matches!(bs.frame_type(), FrameType::IDR | FrameType::I));
+        // Must start with Annex-B 4-byte start code 0x00 0x00 0x00 0x01
+        assert_eq!(&bytes[0..4], &[0, 0, 0, 1]);
+        // First NALU on IDR should be SPS (type 7: 0x67 & 0x1f == 7)
+        assert_eq!(bytes[4] & 0x1f, 7);
+    }
+}
