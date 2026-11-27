@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Activity,
+  ChevronDown,
   Circle,
   Clipboard,
   Download,
   FolderOpen,
   Lock,
   Maximize,
+  Minimize2,
   Monitor,
   Moon,
   PhoneOff,
@@ -18,6 +20,8 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isTauriEnv } from "../lib/tauriBridge";
 import {
   DEFAULT_PERMISSIONS,
   formatBytes,
@@ -73,6 +77,9 @@ export function RemoteViewer({
   const [rttMs, setRttMs] = useState<number | null>(null);
   const [audioMuted, setAudioMuted] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [toolbarRevealed, setToolbarRevealed] = useState(false);
+  const hideToolbarTimerRef = useRef<number | null>(null);
 
   // Local-only session recording (never sent to or stored on server)
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -182,6 +189,14 @@ export function RemoteViewer({
 
     return () => {
       window.clearInterval(statsTimer);
+      if (hideToolbarTimerRef.current !== null) {
+        window.clearTimeout(hideToolbarTimerRef.current);
+      }
+      if (isTauriEnv()) {
+        getCurrentWindow().setFullscreen(false).catch(() => {});
+      } else if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
       if (recorderRef.current && recorderRef.current.state !== "inactive") {
         recorderRef.current.stop();
       }
@@ -189,6 +204,18 @@ export function RemoteViewer({
       clientRef.current = null;
     };
   }, [serverUrl, targetDeviceId, viewerName, pin, authToken]);
+
+  useEffect(() => {
+    const onFsChange = () => {
+      if (!isTauriEnv()) {
+        const active = Boolean(document.fullscreenElement);
+        setIsFullscreen(active);
+        if (!active) setToolbarRevealed(false);
+      }
+    };
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
 
   useEffect(() => {
     if (!isRecording) {
@@ -417,17 +444,74 @@ export function RemoteViewer({
     if (!next) clientRef.current?.resumeAudio();
   };
 
-  const toggleFullscreen = () => {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch(() => {});
+  const toggleFullscreen = async () => {
+    const next = !isFullscreen;
+    if (isTauriEnv()) {
+      try {
+        await getCurrentWindow().setFullscreen(next);
+        setIsFullscreen(next);
+        setToolbarRevealed(false);
+        if (!next) setShowSettings(false);
+      } catch {
+        // fallback to DOM fullscreen
+        if (next) {
+          await document.documentElement.requestFullscreen().catch(() => {});
+        } else {
+          await document.exitFullscreen().catch(() => {});
+        }
+        setIsFullscreen(next);
+      }
     } else {
-      document.exitFullscreen().catch(() => {});
+      if (next) {
+        await document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        await document.exitFullscreen().catch(() => {});
+      }
     }
   };
 
+  const revealToolbar = () => {
+    if (hideToolbarTimerRef.current !== null) {
+      window.clearTimeout(hideToolbarTimerRef.current);
+      hideToolbarTimerRef.current = null;
+    }
+    setToolbarRevealed(true);
+  };
+
+  const scheduleHideToolbar = () => {
+    if (showSettings) return;
+    if (hideToolbarTimerRef.current !== null) {
+      window.clearTimeout(hideToolbarTimerRef.current);
+    }
+    hideToolbarTimerRef.current = window.setTimeout(() => {
+      setToolbarRevealed(false);
+    }, 450);
+  };
+
   return (
-    <div className="viewer-shell">
-      <div className="viewer-toolbar">
+    <div className={`viewer-shell ${isFullscreen ? "fullscreen" : ""}`}>
+      {isFullscreen && !toolbarRevealed && (
+        <div
+          className="fullscreen-hover-zone"
+          onMouseEnter={revealToolbar}
+          onClick={revealToolbar}
+        >
+          <div className="fullscreen-handle-pill">
+            <ChevronDown size={11} />
+            Menú
+          </div>
+        </div>
+      )}
+
+      <div
+        className={`viewer-toolbar ${isFullscreen && toolbarRevealed ? "revealed" : ""}`}
+        onMouseEnter={() => {
+          if (isFullscreen) revealToolbar();
+        }}
+        onMouseLeave={() => {
+          if (isFullscreen) scheduleHideToolbar();
+        }}
+      >
         <div className="viewer-toolbar-group">
           <Monitor size={18} color="var(--accent)" />
           <strong style={{ fontSize: 14 }}>{hostName}</strong>
@@ -476,10 +560,12 @@ export function RemoteViewer({
                 applyStreamConfig(fps, bitrateKbps, Number(e.target.value), scale)
               }
               style={{ padding: "5px 9px", fontSize: 12 }}
+              title="Cambiar monitor remoto"
             >
               {displays.map((d, idx) => (
                 <option key={d.id} value={idx}>
-                  {d.name} ({d.width}x{d.height})
+                  Pantalla {idx + 1}
+                  {d.is_primary ? " ★" : ""} ({d.width}×{d.height})
                 </option>
               ))}
             </select>
@@ -562,9 +648,13 @@ export function RemoteViewer({
           <button
             className="icon-btn"
             onClick={toggleFullscreen}
-            title="Pantalla completa"
+            title={
+              isFullscreen
+                ? "Salir de pantalla completa"
+                : "Pantalla completa (sin barra superior)"
+            }
           >
-            <Maximize size={16} />
+            {isFullscreen ? <Minimize2 size={16} /> : <Maximize size={16} />}
           </button>
 
           <button
