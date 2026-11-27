@@ -304,4 +304,26 @@ mod tests {
         // First NALU on IDR should be SPS (type 7: 0x67 & 0x1f == 7)
         assert_eq!(bytes[4] & 0x1f, 7);
     }
+
+    #[test]
+    #[ignore = "requires an active interactive desktop session"]
+    fn real_monitor_h264_capture_works() {
+        let mut cap = H264ScreenCapturer::new(0);
+        let res = cap.capture_and_encode(0, 1.0, 2500, 30, true);
+        match res {
+            Ok(Some(frame)) => {
+                println!(
+                    "CAPTURED REAL MONITOR: {}x{}, keyframe={}, bytes={}",
+                    frame.width,
+                    frame.height,
+                    frame.is_keyframe,
+                    frame.h264_annex_b.len()
+                );
+                assert!(frame.is_keyframe);
+                assert!(!frame.h264_annex_b.is_empty());
+            }
+            Ok(None) => panic!("Expected keyframe on first capture"),
+            Err(e) => panic!("Real monitor capture/encode FAILED: {:?}", e),
+        }
+    }
 }

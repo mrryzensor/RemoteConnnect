@@ -7,6 +7,7 @@ import {
 } from "../types";
 import { base64ToBytes, bytesToBase64, E2eKeyPair, E2eSession } from "./crypto";
 
+const PACKET_VIDEO_JPEG = 0x01;
 const PACKET_AUDIO_PCM16 = 0x02;
 const PACKET_VIDEO_H264 = 0x04;
 
@@ -22,6 +23,8 @@ export interface ViewerCallbacks {
     permissions: SessionPermissions;
   }) => void;
   onVideoFrame: (frame: VideoFrame) => void;
+  onBitmapFrame?: (bitmap: ImageBitmap, width: number, height: number) => void;
+  onDecoderError?: (message: string) => void;
   onMetrics: (metrics: { rttMs?: number; bytesReceived?: number }) => void;
   onClipboard: (text: string) => void;
   onClipboardFiles: (files: ClipboardFileInfo[]) => void;
@@ -53,6 +56,7 @@ export class RemoteViewerClient {
   // WebCodecs hardware-accelerated H.264 decoder
   private videoDecoder: VideoDecoder | null = null;
   private awaitingKeyframe = true;
+  private forceSoftwareDecoder = false;
   private lastVideoW = 0;
   private lastVideoH = 0;
 
@@ -88,8 +92,8 @@ export class RemoteViewerClient {
       return;
     }
 
-    // Probe supported Annex-B H.264 configs (hardware first, then software fallback)
-    const candidates: Array<VideoDecoderConfig & { avc?: { format: "annexb" | "avc" } }> = [
+    // Probe supported Annex-B H.264 configs (hardware first unless fallback triggered)
+    const hwCandidates: Array<VideoDecoderConfig & { avc?: { format: "annexb" | "avc" } }> = [
       {
         codec: "avc1.42E033",
         avc: { format: "annexb" },
@@ -102,10 +106,12 @@ export class RemoteViewerClient {
         hardwareAcceleration: "prefer-hardware",
         optimizeForLatency: true,
       },
+    ];
+    const swCandidates: Array<VideoDecoderConfig & { avc?: { format: "annexb" | "avc" } }> = [
       {
         codec: "avc1.42E02A",
         avc: { format: "annexb" },
-        hardwareAcceleration: "no-preference",
+        hardwareAcceleration: "prefer-software",
         optimizeForLatency: true,
       },
       {
@@ -115,6 +121,9 @@ export class RemoteViewerClient {
         optimizeForLatency: true,
       },
     ];
+    const candidates = this.forceSoftwareDecoder
+      ? swCandidates
+      : [...hwCandidates, ...swCandidates];
 
     let chosen: VideoDecoderConfig | null = null;
     for (const cfg of candidates) {
@@ -141,7 +150,9 @@ export class RemoteViewerClient {
         this.cb.onVideoFrame(frame);
       },
       error: (err) => {
-        console.warn("WebCodecs VideoDecoder error, recovering:", err);
+        console.warn("WebCodecs VideoDecoder error, falling back to software:", err);
+        this.forceSoftwareDecoder = true;
+        this.cb.onDecoderError?.(`VideoDecoder fallback SW: ${String(err)}`);
         this.awaitingKeyframe = true;
         void this.initVideoDecoder().then(() => this.requestKeyframe());
       },
@@ -365,6 +376,31 @@ export class RemoteViewerClient {
     if (plain.length < 2) return;
 
     const packetType = plain[0];
+
+    if (packetType === PACKET_VIDEO_JPEG) {
+      // Backward compatibility if the remote host is running an older JPEG build
+      if (plain.length <= 9 || !this.cb.onBitmapFrame) return;
+      try {
+        const view = new DataView(plain.buffer, plain.byteOffset + 1, 8);
+        const width = view.getUint32(0, false);
+        const height = view.getUint32(4, false);
+        const jpegBytes = plain.subarray(9);
+        const blob = new Blob(
+          [
+            jpegBytes.buffer.slice(
+              jpegBytes.byteOffset,
+              jpegBytes.byteOffset + jpegBytes.byteLength
+            ) as ArrayBuffer,
+          ],
+          { type: "image/jpeg" }
+        );
+        const bitmap = await createImageBitmap(blob);
+        this.cb.onBitmapFrame(bitmap, width, height);
+      } catch {
+        // ignore
+      }
+      return;
+    }
 
     if (packetType === PACKET_VIDEO_H264) {
       if (plain.length <= 14 || !this.videoDecoder || this.videoDecoder.state !== "configured") {

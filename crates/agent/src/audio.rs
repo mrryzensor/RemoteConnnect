@@ -66,9 +66,13 @@ pub fn spawn_audio_capture(active: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<A
 
         let err_fn = |err| warn!("Audio stream error: {}", err);
 
-        // Buffer roughly 40ms of audio before emitting a network packet
-        let target_samples = ((sample_rate as usize) * (channels as usize) * 40) / 1000;
-        let mut accum: Vec<u8> = Vec::with_capacity(target_samples * 2);
+        // Downmix to mono + 2x decimation (e.g. 48kHz stereo -> 24kHz mono: 4x less bandwidth!)
+        let decimate = if sample_rate >= 40_000 { 2usize } else { 1usize };
+        let out_rate = sample_rate / (decimate as u32);
+        let in_ch = (channels as usize).max(1);
+        let target_out_samples = ((out_rate as usize) * 40) / 1000; // 40ms mono chunks
+        let mut accum: Vec<u8> = Vec::with_capacity(target_out_samples * 2);
+        let mut max_abs: i32 = 0;
 
         let stream_res = match sample_format {
             SampleFormat::F32 => {
@@ -76,17 +80,34 @@ pub fn spawn_audio_capture(active: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<A
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[f32], _| {
-                        for &s in data {
-                            let clamped = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                            accum.extend_from_slice(&clamped.to_le_bytes());
+                        let frames = data.len() / in_ch;
+                        let mut f = 0;
+                        while f < frames {
+                            let mut sum = 0.0f32;
+                            for c in 0..in_ch {
+                                sum += data[f * in_ch + c];
+                            }
+                            let mono = sum / (in_ch as f32);
+                            let sample = (mono.clamp(-1.0, 1.0) * 32767.0) as i16;
+                            let a = (sample as i32).abs();
+                            if a > max_abs {
+                                max_abs = a;
+                            }
+                            accum.extend_from_slice(&sample.to_le_bytes());
+                            f += decimate;
                         }
-                        if accum.len() >= target_samples * 2 {
+                        if accum.len() >= target_out_samples * 2 {
                             let payload = std::mem::take(&mut accum);
-                            let _ = tx_c.send(AudioChunk {
-                                sample_rate,
-                                channels,
-                                pcm_i16_le: payload,
-                            });
+                            let peak = max_abs;
+                            max_abs = 0;
+                            // Skip pure digital silence (0 kbps when no audio is playing!)
+                            if peak > 24 {
+                                let _ = tx_c.send(AudioChunk {
+                                    sample_rate: out_rate,
+                                    channels: 1,
+                                    pcm_i16_le: payload,
+                                });
+                            }
                         }
                     },
                     err_fn,
@@ -98,16 +119,32 @@ pub fn spawn_audio_capture(active: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<A
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[i16], _| {
-                        for &s in data {
-                            accum.extend_from_slice(&s.to_le_bytes());
+                        let frames = data.len() / in_ch;
+                        let mut f = 0;
+                        while f < frames {
+                            let mut sum = 0i32;
+                            for c in 0..in_ch {
+                                sum += data[f * in_ch + c] as i32;
+                            }
+                            let sample = (sum / (in_ch as i32)) as i16;
+                            let a = (sample as i32).abs();
+                            if a > max_abs {
+                                max_abs = a;
+                            }
+                            accum.extend_from_slice(&sample.to_le_bytes());
+                            f += decimate;
                         }
-                        if accum.len() >= target_samples * 2 {
+                        if accum.len() >= target_out_samples * 2 {
                             let payload = std::mem::take(&mut accum);
-                            let _ = tx_c.send(AudioChunk {
-                                sample_rate,
-                                channels,
-                                pcm_i16_le: payload,
-                            });
+                            let peak = max_abs;
+                            max_abs = 0;
+                            if peak > 24 {
+                                let _ = tx_c.send(AudioChunk {
+                                    sample_rate: out_rate,
+                                    channels: 1,
+                                    pcm_i16_le: payload,
+                                });
+                            }
                         }
                     },
                     err_fn,
@@ -119,17 +156,32 @@ pub fn spawn_audio_capture(active: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<A
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[u16], _| {
-                        for &s in data {
-                            let signed = (s as i32 - 32768) as i16;
-                            accum.extend_from_slice(&signed.to_le_bytes());
+                        let frames = data.len() / in_ch;
+                        let mut f = 0;
+                        while f < frames {
+                            let mut sum = 0i32;
+                            for c in 0..in_ch {
+                                sum += data[f * in_ch + c] as i32 - 32768;
+                            }
+                            let sample = (sum / (in_ch as i32)) as i16;
+                            let a = (sample as i32).abs();
+                            if a > max_abs {
+                                max_abs = a;
+                            }
+                            accum.extend_from_slice(&sample.to_le_bytes());
+                            f += decimate;
                         }
-                        if accum.len() >= target_samples * 2 {
+                        if accum.len() >= target_out_samples * 2 {
                             let payload = std::mem::take(&mut accum);
-                            let _ = tx_c.send(AudioChunk {
-                                sample_rate,
-                                channels,
-                                pcm_i16_le: payload,
-                            });
+                            let peak = max_abs;
+                            max_abs = 0;
+                            if peak > 24 {
+                                let _ = tx_c.send(AudioChunk {
+                                    sample_rate: out_rate,
+                                    channels: 1,
+                                    pcm_i16_le: payload,
+                                });
+                            }
                         }
                     },
                     err_fn,

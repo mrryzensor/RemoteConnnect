@@ -151,6 +151,26 @@ export function RemoteViewer({
         }
         frame.close();
       },
+      onBitmapFrame: (bitmap, width, height) => {
+        framesInSecond++;
+        const canvas = canvasRef.current;
+        if (!canvas) {
+          bitmap.close();
+          return;
+        }
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(bitmap, 0, 0);
+        }
+        bitmap.close();
+      },
+      onDecoderError: (msg) => {
+        flashToast(msg);
+      },
       onMetrics: (m) => {
         if (m.rttMs !== undefined) setRttMs(m.rttMs);
         if (m.bytesReceived !== undefined) bytesInSecond += m.bytesReceived;
