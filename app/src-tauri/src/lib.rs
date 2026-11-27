@@ -144,6 +144,74 @@ pub struct AppConfig {
 
 static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+#[cfg(target_os = "windows")]
+fn deterministic_machine_device_id() -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+
+    let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Cryptography"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let val_name: Vec<u16> = "MachineGuid"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey = Default::default();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let mut buf = [0u16; 128];
+        let mut byte_len = (buf.len() * std::mem::size_of::<u16>()) as u32;
+        let ok = RegQueryValueExW(
+            hkey,
+            PCWSTR(val_name.as_ptr()),
+            None,
+            None,
+            Some(buf.as_mut_ptr() as *mut u8),
+            Some(&mut byte_len),
+        )
+        .is_ok();
+        let _ = RegCloseKey(hkey);
+        if !ok || byte_len < 4 {
+            return None;
+        }
+        let u16_len = (byte_len as usize) / 2;
+        let guid = String::from_utf16_lossy(&buf[..u16_len])
+            .trim_matches('\0')
+            .trim()
+            .to_string();
+        if guid.is_empty() {
+            return None;
+        }
+        // FNV-1a 64-bit hash -> stable 9-digit device ID (100_000_000..=999_999_999)
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in format!("RemoteConnect-DeviceID-v1:{}", guid).as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let nine_digits = 100_000_000 + (h % 900_000_000);
+        Some(nine_digits.to_string())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn deterministic_machine_device_id() -> Option<String> {
+    None
+}
+
 impl AppConfig {
     fn config_path() -> PathBuf {
         if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
@@ -160,17 +228,38 @@ impl AppConfig {
 
     pub fn load_or_create() -> Self {
         let path = Self::config_path();
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<Self>(&raw) {
-                return cfg;
+        let bak_path = path.with_extension("json.bak");
+
+        // 1. Try primary config.json, then automatic backup config.json.bak
+        for candidate in [&path, &bak_path] {
+            if let Ok(raw) = fs::read_to_string(candidate) {
+                if let Ok(mut cfg) = serde_json::from_str::<Self>(&raw) {
+                    // Self-heal if loaded from backup
+                    if candidate == &bak_path {
+                        cfg.save();
+                    }
+                    // Ensure non-empty device_id
+                    if cfg.device_id.trim().is_empty() {
+                        cfg.device_id = deterministic_machine_device_id()
+                            .unwrap_or_else(generate_device_id);
+                        cfg.save();
+                    }
+                    return cfg;
+                }
             }
         }
+
+        // 2. Preserve any unreadable file before creating a fresh config
+        if path.exists() {
+            let _ = fs::copy(&path, path.with_extension("json.corrupt"));
+        }
+
         let default_name = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "My-Desktop".into());
         let cfg = Self {
-            device_id: generate_device_id(),
+            device_id: deterministic_machine_device_id().unwrap_or_else(generate_device_id),
             device_name: default_name,
             pin: generate_pin(),
             pin_enabled: true,
@@ -190,7 +279,18 @@ impl AppConfig {
     pub fn save(&self) {
         let path = Self::config_path();
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
+            // Atomic write (tmp -> replace) + backup copy so updates/crashes never corrupt config.json
+            let tmp_path = path.with_extension("json.tmp");
+            let bak_path = path.with_extension("json.bak");
+            if fs::write(&tmp_path, &json).is_ok() {
+                if path.exists() {
+                    let _ = fs::copy(&path, &bak_path);
+                }
+                if fs::rename(&tmp_path, &path).is_err() {
+                    let _ = fs::write(&path, &json);
+                    let _ = fs::remove_file(&tmp_path);
+                }
+            }
         }
     }
 }
