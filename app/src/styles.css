@@ -117,6 +117,28 @@ body,
   transition: background-color 0.2s ease, color 0.2s ease;
 }
 
+#root {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+html.is-android #root {
+  padding-top: max(env(safe-area-inset-top, 0px), 32px);
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 24px);
+}
+
+html.is-android .sidebar {
+  padding-top: max(env(safe-area-inset-top, 0px), 36px);
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 28px);
+}
+
+html.is-android .modal-backdrop {
+  padding-top: max(env(safe-area-inset-top, 0px), 36px);
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 28px);
+}
+
 /* Scrollbars */
 ::-webkit-scrollbar {
   width: 7px;
@@ -928,6 +950,15 @@ input::placeholder {
   outline: none;
 }
 
+.viewer-canvas-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 100%;
+  max-height: 100%;
+}
+
 .viewer-canvas {
   max-width: 100%;
   max-height: 100%;
@@ -935,6 +966,31 @@ input::placeholder {
   cursor: default;
   user-select: none;
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7);
+}
+
+.virtual-cursor {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(56, 189, 248, 0.35);
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 1.5px rgba(2, 132, 199, 0.9), 0 2px 8px rgba(0, 0, 0, 0.65);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 30;
+}
+
+.virtual-cursor::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ffffff;
+  transform: translate(-50%, -50%);
 }
 
 .viewer-overlay-msg {

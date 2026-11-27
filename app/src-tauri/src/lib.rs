@@ -135,8 +135,14 @@ pub struct AppConfig {
     pub preferences: UserPreferences,
 }
 
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 impl AppConfig {
     fn config_path() -> PathBuf {
+        if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+            let _ = fs::create_dir_all(dir);
+            return dir.join("config.json");
+        }
         if let Some(proj) = ProjectDirs::from("com", "RemoteConnect", "RemoteConnect") {
             let dir = proj.config_dir();
             let _ = fs::create_dir_all(dir);
@@ -844,6 +850,14 @@ pub fn run() {
             viewer_active: AtomicBool::new(false),
         })
         .setup(move |app| {
+            // Ensure Android/mobile uses the app's writable private config directory
+            if let Ok(app_cfg_dir) = app.path().app_config_dir() {
+                let _ = CONFIG_DIR_OVERRIDE.set(app_cfg_dir);
+                let reloaded = AppConfig::load_or_create();
+                let st = app.state::<DesktopState>();
+                *st.config.lock().unwrap() = reloaded;
+            }
+
             #[cfg(not(target_os = "android"))]
             {
                 // 1. Setup System Tray icon + menu

@@ -138,6 +138,9 @@ function MainApp() {
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
+    if (/Android/i.test(navigator.userAgent)) {
+      document.documentElement.classList.add("is-android");
+    }
     try {
       localStorage.setItem(THEME_KEY, theme);
     } catch {
