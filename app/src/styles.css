@@ -613,6 +613,10 @@ input::placeholder {
   margin: 0 auto;
 }
 
+.main-area > section {
+  flex-shrink: 0;
+}
+
 /* Connect Hero */
 .connect-hero {
   background: var(--bg-hero);
@@ -622,6 +626,7 @@ input::placeholder {
   box-shadow: var(--shadow-md);
   position: relative;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .connect-hero::after {
@@ -1226,7 +1231,21 @@ input::placeholder {
   }
 
   .main-area {
-    padding: 18px 16px 28px;
+    padding: 16px 14px 36px;
+    gap: 18px;
+  }
+
+  .connect-hero {
+    padding: 18px 16px;
+  }
+
+  .connect-hero h2 {
+    font-size: 18px;
+  }
+
+  .connect-hero p {
+    font-size: 12.5px;
+    margin-bottom: 14px;
   }
 
   .connect-form {

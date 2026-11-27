@@ -16,6 +16,7 @@ pub struct PeerChannels {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HostPeer {
     pub device_id: String,
     pub device_name: String,
@@ -26,6 +27,7 @@ pub struct HostPeer {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ActiveSession {
     pub session_id: String,
     pub host_device_id: String,

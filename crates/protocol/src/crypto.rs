@@ -86,10 +86,10 @@ impl E2eSession {
     pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| CryptoError::EncryptionFailed)?;
 
         let mut out = Vec::with_capacity(12 + ciphertext.len());
@@ -103,10 +103,13 @@ impl E2eSession {
         if data.len() < 12 + 16 {
             return Err(CryptoError::CiphertextTooShort);
         }
-        let nonce = Nonce::from_slice(&data[..12]);
+        let nonce_bytes: [u8; 12] = data[..12]
+            .try_into()
+            .map_err(|_| CryptoError::CiphertextTooShort)?;
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = &data[12..];
         self.cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 

@@ -139,7 +139,8 @@ function MainApp() {
 
   const [toast, setToast] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState<string>("0.1.15");
+  const [androidUpdateUrl, setAndroidUpdateUrl] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string>("0.1.18");
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -310,18 +311,10 @@ function MainApp() {
         const apkUrl =
           androidUrl ||
           `https://github.com/mrryzensor/RemoteConnnect/releases/download/${tag}/RemoteConnect-Android-arm64.apk`;
-        setUpdatingStatus(`Actualizando a ${tag}...`);
-        // Trigger external browser/DownloadManager download in Android WebView
-        const a = document.createElement("a");
-        a.href = apkUrl;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.open(apkUrl, "_blank");
-        window.setTimeout(() => setUpdatingStatus(null), 7000);
-        return `Descargando ${tag}...`;
+        setAndroidUpdateUrl(apkUrl);
+        setUpdatingStatus(`Nueva versión ${tag} lista para instalar`);
+        window.open(apkUrl, "_blank", "noopener,noreferrer");
+        return `Abriendo descarga de ${tag} en el navegador...`;
       }
 
       const exeUrl =
@@ -523,14 +516,40 @@ function MainApp() {
     <div className="app-shell">
       {updatingStatus && (
         <div className="auto-update-overlay">
-          <div className="auto-update-card">
-            <span className="auto-update-spinner" />
-            <div>
-              <div style={{ fontWeight: 700, fontSize: 14 }}>{updatingStatus}</div>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
-                Descargando e instalando automáticamente, por favor espera...
+          <div className="auto-update-card" style={{ flexDirection: "column", alignItems: "stretch" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              {!androidUpdateUrl && <span className="auto-update-spinner" />}
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{updatingStatus}</div>
+                <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
+                  {androidUpdateUrl
+                    ? "En Android, abre el APK desde tus notificaciones de Descarga o pulsa el botón para descargar e instalar."
+                    : "Descargando e instalando automáticamente, por favor espera..."}
+                </div>
               </div>
             </div>
+            {androidUpdateUrl && (
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 10 }}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    setUpdatingStatus(null);
+                    setAndroidUpdateUrl(null);
+                  }}
+                >
+                  Cerrar
+                </button>
+                <a
+                  className="btn btn-primary btn-sm"
+                  href={androidUpdateUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ textDecoration: "none" }}
+                >
+                  Descargar / Instalar APK
+                </a>
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -463,7 +463,8 @@ export function RemoteViewer({
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!permissions.allow_input) return;
-    if (performance.now() - lastTouchTimeRef.current < 800) return; // ignore synthetic mouse after touch
+    if (isTouchDevice && touchMode === "cursor") return;
+    if (performance.now() - lastTouchTimeRef.current < 1000) return; // ignore synthetic mouse after touch
     const now = performance.now();
     if (now - lastMoveSentRef.current < 16) return; // ~60 Hz ultra-responsive mouse
     lastMoveSentRef.current = now;
@@ -472,7 +473,8 @@ export function RemoteViewer({
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (performance.now() - lastTouchTimeRef.current < 800) return; // ignore synthetic mouse after touch
+    if (isTouchDevice && touchMode === "cursor") return;
+    if (performance.now() - lastTouchTimeRef.current < 1000) return; // ignore synthetic mouse after touch
     e.preventDefault();
     clientRef.current?.resumeAudio();
     stageRef.current?.focus();
@@ -482,7 +484,8 @@ export function RemoteViewer({
   };
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (performance.now() - lastTouchTimeRef.current < 800) return; // ignore synthetic mouse after touch
+    if (isTouchDevice && touchMode === "cursor") return;
+    if (performance.now() - lastTouchTimeRef.current < 1000) return; // ignore synthetic mouse after touch
     e.preventDefault();
     if (!permissions.allow_input) return;
     const { x, y } = getNormalizedCoords(e);
