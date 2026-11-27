@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   DEFAULT_PERMISSIONS,
+  type ActiveHostSession,
   type AgentEvent,
   type AppConfig,
   type SavedDevice,
@@ -164,4 +165,78 @@ export async function onAgentEvent(
     return listen<AgentEvent>("agent-event", (event) => cb(event.payload));
   }
   return () => {};
+}
+
+export async function getAutostart(): Promise<boolean> {
+  if (isTauriEnv()) {
+    return invoke<boolean>("get_autostart");
+  }
+  return false;
+}
+
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  if (isTauriEnv()) {
+    return invoke<boolean>("set_autostart", { enabled });
+  }
+  return false;
+}
+
+export async function getActiveHostSessions(): Promise<ActiveHostSession[]> {
+  if (isTauriEnv()) {
+    return invoke<ActiveHostSession[]>("get_active_host_sessions");
+  }
+  return [];
+}
+
+export async function setViewerMode(active: boolean): Promise<void> {
+  if (isTauriEnv()) {
+    await invoke("set_viewer_mode", { active }).catch(() => {});
+  }
+}
+
+export async function showMainWindow(): Promise<void> {
+  if (isTauriEnv()) {
+    await invoke("show_main_window").catch(() => {});
+  }
+}
+
+export function serverWsToHttpBase(serverUrl: string): string | null {
+  try {
+    const u = new URL(serverUrl);
+    u.protocol = u.protocol === "wss:" ? "https:" : "http:";
+    u.pathname = u.pathname.replace(/\/ws\/?$/, "");
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+export interface DeviceOnlineInfo {
+  online: boolean;
+  device_name?: string | null;
+  os?: string | null;
+}
+
+export async function fetchDeviceOnlineStatus(
+  serverUrl: string,
+  deviceId: string
+): Promise<DeviceOnlineInfo | null> {
+  const base = serverWsToHttpBase(serverUrl);
+  if (!base) return null;
+  try {
+    const res = await fetch(`${base}/api/devices/${encodeURIComponent(deviceId)}/status`, {
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as DeviceOnlineInfo;
+    return {
+      online: Boolean(data.online),
+      device_name: data.device_name ?? null,
+      os: data.os ?? null,
+    };
+  } catch {
+    return null;
+  }
 }

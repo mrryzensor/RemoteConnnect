@@ -36,7 +36,9 @@ import {
 } from "./types";
 import {
   disconnectHostSession,
+  fetchDeviceOnlineStatus,
   getAgentStatus,
+  getAutostart,
   getConfig,
   isTauriEnv,
   onAgentEvent,
@@ -44,10 +46,13 @@ import {
   removeDevice,
   respondIncomingRequest,
   saveDevice,
+  setAutostart,
+  setViewerMode,
   updateAccessSettings,
   updateServerSettings,
 } from "./lib/tauriBridge";
 import { ApprovalModal } from "./components/ApprovalModal";
+import { HostSessionWidget } from "./components/HostSessionWidget";
 import { RemoteViewer } from "./components/RemoteViewer";
 
 interface ActiveViewerSession {
@@ -70,11 +75,26 @@ function getInitialTheme(): "dark" | "light" {
 }
 
 export default function App() {
+  const isWidgetMode =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("mode") === "widget";
+
+  if (isWidgetMode) {
+    return <HostSessionWidget />;
+  }
+
+  return <MainApp />;
+}
+
+function MainApp() {
   const [theme, setTheme] = useState<"dark" | "light">(getInitialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [agentStatus, setAgentStatus] = useState<string>("connecting");
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean>(false);
+  const [deviceOnlineMap, setDeviceOnlineMap] = useState<Record<string, boolean>>({});
+  const [refreshingStatuses, setRefreshingStatuses] = useState(false);
   const [targetIdInput, setTargetIdInput] = useState("");
   const [targetPinInput, setTargetPinInput] = useState("");
   const [showTargetPin, setShowTargetPin] = useState(false);
@@ -153,6 +173,10 @@ export default function App() {
       setDeviceNameDraft(cfg.device_name);
       const st = await getAgentStatus();
       setAgentStatus(st);
+      if (isTauriEnv()) {
+        const auto = await getAutostart().catch(() => false);
+        setAutostartEnabled(auto);
+      }
     })();
 
     let unlisten: (() => void) | undefined;
@@ -197,6 +221,49 @@ export default function App() {
       unlisten?.();
     };
   }, []);
+
+  useEffect(() => {
+    void setViewerMode(Boolean(activeViewer));
+  }, [activeViewer]);
+
+  const refreshDeviceStatuses = async (
+    serverUrl: string,
+    devices: SavedDevice[]
+  ) => {
+    if (devices.length === 0) return;
+    setRefreshingStatuses(true);
+    try {
+      const results = await Promise.all(
+        devices.map(async (dev) => {
+          const info = await fetchDeviceOnlineStatus(serverUrl, dev.id);
+          return [dev.id, info?.online ?? false] as const;
+        })
+      );
+      setDeviceOnlineMap((prev) => {
+        const next = { ...prev };
+        for (const [id, online] of results) {
+          next[id] = online;
+        }
+        return next;
+      });
+    } finally {
+      setRefreshingStatuses(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!config || config.saved_devices.length === 0 || activeViewer) return;
+    void refreshDeviceStatuses(config.server_url, config.saved_devices);
+    const id = window.setInterval(() => {
+      void refreshDeviceStatuses(config.server_url, config.saved_devices);
+    }, 8000);
+    return () => window.clearInterval(id);
+  }, [config?.server_url, config?.saved_devices, activeViewer]);
+
+  const onlineDevicesCount = useMemo(() => {
+    if (!config) return 0;
+    return config.saved_devices.filter((d) => deviceOnlineMap[d.id]).length;
+  }, [config, deviceOnlineMap]);
 
   const filteredDevices = useMemo(() => {
     if (!config) return [];
@@ -508,6 +575,42 @@ export default function App() {
                 <Sliders size={14} />
                 Contraseña, PIN y Permisos
               </button>
+
+              <label
+                className="toggle-row"
+                style={{
+                  marginTop: 12,
+                  paddingTop: 12,
+                  borderTop: "1px solid var(--border)",
+                  fontSize: 12.5,
+                }}
+              >
+                <div>
+                  <strong style={{ fontWeight: 600 }}>Iniciar con Windows</strong>
+                  <div className="toggle-desc">En segundo plano (System Tray)</div>
+                </div>
+                <span className="switch">
+                  <input
+                    type="checkbox"
+                    checked={autostartEnabled}
+                    onChange={async (e) => {
+                      const next = e.target.checked;
+                      try {
+                        const res = await setAutostart(next);
+                        setAutostartEnabled(res);
+                        notify(
+                          res
+                            ? "RemoteConnect iniciará automáticamente con Windows"
+                            : "Inicio automático con Windows desactivado"
+                        );
+                      } catch {
+                        notify("No se pudo actualizar el inicio automático");
+                      }
+                    }}
+                  />
+                  <span className="switch-slider" />
+                </span>
+              </label>
             </>
           ) : (
             <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.55 }}>
@@ -650,20 +753,38 @@ export default function App() {
               <h3>
                 Dispositivos guardados
                 <span className="count-badge">{config.saved_devices.length}</span>
+                {config.saved_devices.length > 0 && (
+                  <span className="status-pill online" style={{ fontSize: 11, padding: "2px 8px" }}>
+                    <span className="status-dot" />
+                    {onlineDevicesCount} en línea
+                  </span>
+                )}
               </h3>
 
               <div className="section-tools">
                 {config.saved_devices.length > 0 && (
-                  <div className="input-with-icon">
-                    <Search size={14} className="input-icon-left" />
-                    <input
-                      type="search"
-                      className="search-input"
-                      placeholder="Buscar equipo..."
-                      value={deviceQuery}
-                      onChange={(e) => setDeviceQuery(e.target.value)}
-                    />
-                  </div>
+                  <>
+                    <button
+                      className="icon-btn"
+                      onClick={() =>
+                        void refreshDeviceStatuses(config.server_url, config.saved_devices)
+                      }
+                      title="Actualizar estado en línea"
+                      disabled={refreshingStatuses}
+                    >
+                      <RefreshCw size={15} />
+                    </button>
+                    <div className="input-with-icon">
+                      <Search size={14} className="input-icon-left" />
+                      <input
+                        type="search"
+                        className="search-input"
+                        placeholder="Buscar equipo..."
+                        value={deviceQuery}
+                        onChange={(e) => setDeviceQuery(e.target.value)}
+                      />
+                    </div>
+                  </>
                 )}
                 <button
                   className="btn btn-secondary btn-sm"
@@ -704,44 +825,62 @@ export default function App() {
               </div>
             ) : (
               <div className="devices-grid">
-                {filteredDevices.map((dev) => (
-                  <div key={dev.id} className="device-tile">
-                    <div className="device-tile-head">
-                      <div className="device-avatar">
-                        {dev.name.slice(0, 2).toUpperCase()}
+                {filteredDevices.map((dev) => {
+                  const statusKnown = dev.id in deviceOnlineMap;
+                  const isOnline = Boolean(deviceOnlineMap[dev.id]);
+                  return (
+                    <div key={dev.id} className="device-tile">
+                      <div className="device-tile-head">
+                        <div className="device-avatar" style={{ position: "relative" }}>
+                          {dev.name.slice(0, 2).toUpperCase()}
+                          <span
+                            className={`device-presence-dot ${
+                              statusKnown ? (isOnline ? "online" : "offline") : "checking"
+                            }`}
+                          />
+                        </div>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div className="device-tile-name">{dev.name}</div>
+                          <div className="device-tile-id">{formatDeviceId(dev.id)}</div>
+                        </div>
+                        <span
+                          className={`status-pill ${
+                            statusKnown ? (isOnline ? "online" : "offline") : "connecting"
+                          }`}
+                          style={{ fontSize: 10.5, padding: "3px 8px", flexShrink: 0 }}
+                        >
+                          <span className="status-dot" />
+                          {statusKnown ? (isOnline ? "En línea" : "Sin conexión") : "..."}
+                        </span>
                       </div>
-                      <div style={{ minWidth: 0, flex: 1 }}>
-                        <div className="device-tile-name">{dev.name}</div>
-                        <div className="device-tile-id">{formatDeviceId(dev.id)}</div>
+
+                      <div className="device-tile-meta">
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <KeyRound size={12} />
+                          {dev.pin ? "Acceso rápido guardado" : "Requiere aprobación"}
+                        </span>
+                      </div>
+
+                      <div className="device-tile-actions">
+                        <button
+                          className="btn btn-primary btn-sm"
+                          style={{ flex: 1 }}
+                          onClick={() => startConnection(dev.id, dev.pin ?? undefined)}
+                        >
+                          <Play size={13} />
+                          Conectar
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => handleDeleteDevice(dev.id)}
+                          title="Eliminar de la libreta"
+                        >
+                          <Trash2 size={13} />
+                        </button>
                       </div>
                     </div>
-
-                    <div className="device-tile-meta">
-                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                        <KeyRound size={12} />
-                        {dev.pin ? "Acceso rápido guardado" : "Requiere aprobación"}
-                      </span>
-                    </div>
-
-                    <div className="device-tile-actions">
-                      <button
-                        className="btn btn-primary btn-sm"
-                        style={{ flex: 1 }}
-                        onClick={() => startConnection(dev.id, dev.pin ?? undefined)}
-                      >
-                        <Play size={13} />
-                        Conectar
-                      </button>
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => handleDeleteDevice(dev.id)}
-                        title="Eliminar de la libreta"
-                      >
-                        <Trash2 size={13} />
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </section>

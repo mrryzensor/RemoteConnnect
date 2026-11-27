@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capability for RemoteConnect desktop app","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-set-fullscreen","core:window:allow-is-fullscreen"]}}
+{"default":{"identifier":"default","description":"Default capability for RemoteConnect desktop app","local":true,"windows":["main","host-widget"],"permissions":["core:default","core:window:allow-set-fullscreen","core:window:allow-is-fullscreen","core:window:allow-start-dragging","core:window:allow-hide","core:window:allow-show"]}}

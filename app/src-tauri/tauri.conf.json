@@ -12,12 +12,14 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "RemoteConnect",
         "width": 1240,
         "height": 800,
         "minWidth": 900,
         "minHeight": 620,
-        "resizable": true
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {

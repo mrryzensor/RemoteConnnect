@@ -1,12 +1,18 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use directories::ProjectDirs;
 use remoteconnect_agent::{start_agent, AgentConfig, AgentEvent, AgentHandle};
 use remoteconnect_protocol::{generate_device_id, generate_pin, SessionPermissions};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindowBuilder,
+    WindowEvent,
+};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +21,12 @@ pub struct SavedDevice {
     pub name: String,
     pub pin: Option<String>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveHostSessionInfo {
+    pub session_id: String,
+    pub viewer_name: String,
 }
 
 fn default_true() -> bool {
@@ -38,6 +50,8 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub saved_devices: Vec<SavedDevice>,
+    #[serde(default)]
+    pub autostart_initialized: bool,
 }
 
 impl AppConfig {
@@ -72,6 +86,7 @@ impl AppConfig {
             server_url: "wss://remote.2mail.us/ws".into(),
             auth_token: None,
             saved_devices: vec![],
+            autostart_initialized: false,
         };
         cfg.save();
         cfg
@@ -89,6 +104,162 @@ struct DesktopState {
     config: Mutex<AppConfig>,
     agent: Mutex<Option<AgentHandle>>,
     agent_status: Mutex<String>,
+    active_sessions: Mutex<Vec<ActiveHostSessionInfo>>,
+    viewer_active: AtomicBool,
+}
+
+// ============================================================
+// Windows Auto-Start (HKCU\Software\Microsoft\Windows\CurrentVersion\Run)
+// ============================================================
+
+#[cfg(target_os = "windows")]
+mod autostart {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+        HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
+    };
+
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const VALUE_NAME: &str = "RemoteConnect";
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn is_enabled() -> bool {
+        unsafe {
+            let subkey = to_wide(RUN_KEY);
+            let mut hkey = Default::default();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                Some(0),
+                KEY_READ,
+                &mut hkey,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let name = to_wide(VALUE_NAME);
+            let exists = RegQueryValueExW(
+                hkey,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_ok();
+            let _ = RegCloseKey(hkey);
+            exists
+        }
+    }
+
+    pub fn set_enabled(enabled: bool) -> Result<bool, String> {
+        unsafe {
+            let subkey = to_wide(RUN_KEY);
+            let mut hkey = Default::default();
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                Some(0),
+                KEY_WRITE,
+                &mut hkey,
+            )
+            .ok()
+            .map_err(|e| format!("RegOpenKeyExW failed: {:?}", e))?;
+
+            let name = to_wide(VALUE_NAME);
+            let result = if enabled {
+                let exe = std::env::current_exe()
+                    .map_err(|e| format!("current_exe failed: {}", e))?;
+                let cmd = format!("\"{}\" --background", exe.display());
+                let wide = to_wide(&cmd);
+                let bytes = std::slice::from_raw_parts(
+                    wide.as_ptr() as *const u8,
+                    wide.len() * std::mem::size_of::<u16>(),
+                );
+                RegSetValueExW(hkey, PCWSTR(name.as_ptr()), Some(0), REG_SZ, Some(bytes))
+                    .ok()
+                    .map_err(|e| format!("RegSetValueExW failed: {:?}", e))
+            } else {
+                let _ = RegDeleteValueW(hkey, PCWSTR(name.as_ptr()));
+                Ok(())
+            };
+
+            let _ = RegCloseKey(hkey);
+            result.map(|_| enabled)
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod autostart {
+    pub fn is_enabled() -> bool {
+        false
+    }
+    pub fn set_enabled(_enabled: bool) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+// ============================================================
+// Minimalist Host Session Floating Widget Window
+// ============================================================
+
+fn show_or_create_host_widget(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("host-widget") {
+        let _ = win.show();
+        return;
+    }
+
+    let width = 276.0;
+    let height = 42.0;
+
+    let builder = WebviewWindowBuilder::new(
+        app,
+        "host-widget",
+        WebviewUrl::App("index.html?mode=widget".into()),
+    )
+    .title("RemoteConnect Sesión")
+    .inner_size(width, height)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .visible(true);
+
+    if let Ok(win) = builder.build() {
+        // Position unobtrusively at the bottom-right corner above the taskbar
+        if let Ok(Some(monitor)) = win.current_monitor() {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            let w_px = (width * scale) as i32;
+            let h_px = (height * scale) as i32;
+            let margin_x = (16.0 * scale) as i32;
+            let margin_y = (58.0 * scale) as i32;
+            let x = (size.width as i32 - w_px - margin_x).max(0);
+            let y = (size.height as i32 - h_px - margin_y).max(0);
+            let _ = win.set_position(PhysicalPosition::new(x, y));
+        }
+    }
+}
+
+fn hide_host_widget(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("host-widget") {
+        let _ = win.hide();
+    }
+}
+
+fn reveal_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
 }
 
 fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
@@ -119,14 +290,52 @@ fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = ev_rx.recv().await {
             if let Some(st) = app_handle.try_state::<DesktopState>() {
-                let status = match &ev {
-                    AgentEvent::Connecting { .. } => Some("connecting"),
-                    AgentEvent::Registered { .. } => Some("online"),
-                    AgentEvent::Disconnected { .. } => Some("offline"),
-                    _ => None,
-                };
-                if let Some(s) = status {
-                    *st.agent_status.lock().unwrap() = s.into();
+                match &ev {
+                    AgentEvent::Connecting { .. } => {
+                        *st.agent_status.lock().unwrap() = "connecting".into();
+                    }
+                    AgentEvent::Registered { .. } => {
+                        *st.agent_status.lock().unwrap() = "online".into();
+                    }
+                    AgentEvent::Disconnected { .. } => {
+                        *st.agent_status.lock().unwrap() = "offline".into();
+                    }
+                    AgentEvent::IncomingRequest { .. } => {
+                        // Bring main window to front only when manual approval is required
+                        reveal_main_window(&app_handle);
+                    }
+                    AgentEvent::SessionStarted {
+                        session_id,
+                        viewer_name,
+                    } => {
+                        {
+                            let mut list = st.active_sessions.lock().unwrap();
+                            list.retain(|s| s.session_id != *session_id);
+                            list.push(ActiveHostSessionInfo {
+                                session_id: session_id.clone(),
+                                viewer_name: viewer_name.clone(),
+                            });
+                        }
+                        // Show ONLY the ultra-minimalist floating widget on the remote host
+                        // (hide the full main window unless the user is actively viewing another PC)
+                        if !st.viewer_active.load(Ordering::Relaxed) {
+                            if let Some(main_win) = app_handle.get_webview_window("main") {
+                                let _ = main_win.hide();
+                            }
+                        }
+                        show_or_create_host_widget(&app_handle);
+                    }
+                    AgentEvent::SessionEnded { session_id, .. } => {
+                        let remaining = {
+                            let mut list = st.active_sessions.lock().unwrap();
+                            list.retain(|s| s.session_id != *session_id);
+                            list.len()
+                        };
+                        if remaining == 0 {
+                            hide_host_widget(&app_handle);
+                        }
+                    }
+                    AgentEvent::Error { .. } => {}
                 }
             }
             let _ = app_handle.emit("agent-event", &ev);
@@ -142,6 +351,31 @@ fn get_config(state: State<'_, DesktopState>) -> AppConfig {
 #[tauri::command]
 fn get_agent_status(state: State<'_, DesktopState>) -> String {
     state.agent_status.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_active_host_sessions(state: State<'_, DesktopState>) -> Vec<ActiveHostSessionInfo> {
+    state.active_sessions.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_autostart() -> bool {
+    autostart::is_enabled()
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<bool, String> {
+    autostart::set_enabled(enabled)
+}
+
+#[tauri::command]
+fn set_viewer_mode(state: State<'_, DesktopState>, active: bool) {
+    state.viewer_active.store(active, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn show_main_window(app: AppHandle) {
+    reveal_main_window(&app);
 }
 
 #[tauri::command]
@@ -252,22 +486,92 @@ fn remove_device(state: State<'_, DesktopState>, device_id: String) -> Vec<Saved
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt::try_init();
-    let initial_cfg = AppConfig::load_or_create();
+    let mut initial_cfg = AppConfig::load_or_create();
+    let start_in_background = std::env::args().any(|a| a == "--background");
+
+    // Enable Windows auto-start automatically on first launch (can be toggled anytime in UI)
+    if !initial_cfg.autostart_initialized {
+        let _ = autostart::set_enabled(true);
+        initial_cfg.autostart_initialized = true;
+        initial_cfg.save();
+    } else if autostart::is_enabled() {
+        // Keep registry path updated in case the portable exe was moved/replaced
+        let _ = autostart::set_enabled(true);
+    }
 
     tauri::Builder::default()
         .manage(DesktopState {
             config: Mutex::new(initial_cfg),
             agent: Mutex::new(None),
             agent_status: Mutex::new("offline".into()),
+            active_sessions: Mutex::new(vec![]),
+            viewer_active: AtomicBool::new(false),
         })
-        .setup(|app| {
+        .setup(move |app| {
+            // 1. Setup System Tray icon + menu
+            let open_item = MenuItem::with_id(app, "open", "Abrir RemoteConnect", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Salir completamente", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+
+            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                .tooltip("RemoteConnect — Disponible en segundo plano")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => reveal_main_window(app),
+                    "quit" => {
+                        if let Some(st) = app.try_state::<DesktopState>() {
+                            if let Some(agent) = st.agent.lock().unwrap().take() {
+                                agent.stop();
+                            }
+                        }
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        reveal_main_window(tray.app_handle());
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+            let _ = tray_builder.build(app)?;
+
+            // 2. Show main window only when NOT launched with --background
+            if !start_in_background {
+                reveal_main_window(app.handle());
+            }
+
+            // 3. Start embedded host agent so this PC is always reachable
             let state = app.state::<DesktopState>();
             spawn_embedded_agent(app.handle(), &state);
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    // Minimize to system tray instead of killing the background agent
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_agent_status,
+            get_active_host_sessions,
+            get_autostart,
+            set_autostart,
+            set_viewer_mode,
+            show_main_window,
             update_server_settings,
             update_access_settings,
             regenerate_pin,
