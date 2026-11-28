@@ -1,6 +1,6 @@
 [package]
 name = "remoteconnect-desktop"
-version = "0.1.25"
+version = "0.1.26"
 description = "RemoteConnect Desktop App (Host + Viewer)"
 authors = ["RemoteConnect"]
 edition = "2021"

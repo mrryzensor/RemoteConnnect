@@ -118,17 +118,7 @@ jobs:
           export NDK_HOME="${ANDROID_HOME}/ndk/27.0.12077973"
           npx tauri android init --ci
 
-          # Inject native Android in-app APK downloader & PackageInstaller bridge (window.AndroidUpdater)
-          ANDROID_MAIN="src-tauri/gen/android/app/src/main"
-          mkdir -p "$ANDROID_MAIN/res/xml"
-          cat > "$ANDROID_MAIN/res/xml/update_file_paths.xml" <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <paths>
-              <cache-path name="updates" path="." />
-              <external-cache-path name="ext_updates" path="." />
-          </paths>
-          EOF
-
+          # Inject native Android in-app APK downloader & official PackageInstaller.Session bridge (window.AndroidUpdater)
           python3 - <<'PYEOF'
           from pathlib import Path
           manifest_path = Path("src-tauri/gen/android/app/src/main/AndroidManifest.xml")
@@ -139,33 +129,25 @@ jobs:
                   '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <application',
                   1,
               )
-          provider_xml = '''
-                  <provider
-                      android:name="androidx.core.content.FileProvider"
-                      android:authorities="${applicationId}.updateprovider"
-                      android:exported="false"
-                      android:grantUriPermissions="true">
-                      <meta-data
-                          android:name="android.support.FILE_PROVIDER_PATHS"
-                          android:resource="@xml/update_file_paths" />
-                  </provider>
-              </application>'''
-          if "updateprovider" not in txt:
-              txt = txt.replace("</application>", provider_xml, 1)
           manifest_path.write_text(txt, encoding="utf-8")
 
           main_act = next(Path("src-tauri/gen/android/app/src/main/java").rglob("MainActivity.kt"))
           pkg_line = main_act.read_text(encoding="utf-8").splitlines()[0]
           kotlin_code = f'''{pkg_line}
 
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageInstaller
           import android.net.Uri
           import android.os.Build
           import android.provider.Settings
           import android.webkit.JavascriptInterface
           import android.webkit.WebView
-          import androidx.core.content.FileProvider
           import java.io.File
+          import java.io.FileInputStream
           import java.io.FileOutputStream
           import java.net.HttpURLConnection
           import java.net.URL
@@ -174,11 +156,57 @@ jobs:
           class MainActivity : TauriActivity() {{
             private var activeWebView: WebView? = null
             private var downloadedApk: File? = null
+            private var installReceiverRegistered = false
+
+            private val installAction: String
+              get() = applicationContext.packageName + ".INSTALL_UPDATE_RESULT"
+
+            private val installReceiver = object : BroadcastReceiver() {{
+              override fun onReceive(context: Context, intent: Intent) {{
+                val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
+                when (status) {{
+                  PackageInstaller.STATUS_PENDING_USER_ACTION -> {{
+                    @Suppress("DEPRECATION")
+                    val confirmIntent = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                    if (confirmIntent != null) {{
+                      confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(confirmIntent)
+                    }}
+                  }}
+                  PackageInstaller.STATUS_SUCCESS -> {{
+                    evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('Actualización instalada correctamente')")
+                  }}
+                  else -> {{
+                    val msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "Error de instalación ($status)"
+                    val safe = msg.replace("'", "")
+                    evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('$safe')")
+                  }}
+                }}
+              }}
+            }}
 
             override fun onWebViewCreate(webView: WebView) {{
               super.onWebViewCreate(webView)
               activeWebView = webView
               webView.addJavascriptInterface(AndroidUpdaterBridge(), "AndroidUpdater")
+              if (!installReceiverRegistered) {{
+                val filter = IntentFilter(installAction)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {{
+                  registerReceiver(installReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                }} else {{
+                  @Suppress("UnspecifiedRegisterReceiverFlag")
+                  registerReceiver(installReceiver, filter)
+                }}
+                installReceiverRegistered = true
+              }}
+            }}
+
+            override fun onDestroy() {{
+              if (installReceiverRegistered) {{
+                try {{ unregisterReceiver(installReceiver) }} catch (_: Exception) {{}}
+                installReceiverRegistered = false
+              }}
+              super.onDestroy()
             }}
 
             inner class AndroidUpdaterBridge {{
@@ -232,6 +260,10 @@ jobs:
                       }}
                     }}
                     conn.disconnect()
+                    if (outFile.length() < 100_000) {{
+                      evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('Descarga incompleta del APK')")
+                      return@thread
+                    }}
                     downloadedApk = outFile
                     evalJs("window.__onAndroidUpdateReady && window.__onAndroidUpdateReady()")
                   }} catch (e: Exception) {{
@@ -244,36 +276,54 @@ jobs:
               @JavascriptInterface
               fun installApk() {{
                 val file = downloadedApk ?: File(cacheDir, "RemoteConnect-update.apk")
-                if (!file.exists()) {{
-                  evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('Archivo APK no encontrado')")
+                if (!file.exists() || file.length() < 100_000) {{
+                  evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('Archivo APK no encontrado o incompleto')")
                   return
                 }}
-                runOnUiThread {{
-                  try {{
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {{
-                      val settingsIntent = Intent(
-                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                        Uri.parse("package:" + applicationContext.packageName)
-                      ).apply {{
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                      }}
-                      startActivity(settingsIntent)
-                      evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('Activa Permitir desde esta fuente y vuelve a pulsar Instalar APK ahora')")
-                      return@runOnUiThread
-                    }}
-                    val uri = FileProvider.getUriForFile(
-                      this@MainActivity,
-                      applicationContext.packageName + ".updateprovider",
-                      file
-                    )
-                    val intent = Intent(Intent.ACTION_VIEW).apply {{
-                      setDataAndType(uri, "application/vnd.android.package-archive")
-                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {{
+                  runOnUiThread {{
+                    val settingsIntent = Intent(
+                      Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                      Uri.parse("package:" + applicationContext.packageName)
+                    ).apply {{
                       addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }}
-                    startActivity(intent)
+                    startActivity(settingsIntent)
+                  }}
+                  evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('Activa Permitir desde esta fuente y vuelve a pulsar Instalar APK ahora')")
+                  return
+                }}
+                thread(start = true) {{
+                  try {{
+                    val installer = packageManager.packageInstaller
+                    val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+                    params.setAppPackageName(applicationContext.packageName)
+                    val sessionId = installer.createSession(params)
+                    installer.openSession(sessionId).use {{ session ->
+                      session.openWrite("RemoteConnect-update.apk", 0, file.length()).use {{ out ->
+                        FileInputStream(file).use {{ input ->
+                          input.copyTo(out)
+                        }}
+                        session.fsync(out)
+                      }}
+                      val callbackIntent = Intent(installAction).apply {{
+                        setPackage(applicationContext.packageName)
+                      }}
+                      val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {{
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                      }} else {{
+                        PendingIntent.FLAG_UPDATE_CURRENT
+                      }}
+                      val pendingIntent = PendingIntent.getBroadcast(
+                        this@MainActivity,
+                        sessionId,
+                        callbackIntent,
+                        flags
+                      )
+                      session.commit(pendingIntent.intentSender)
+                    }}
                   }} catch (e: Exception) {{
-                    val safe = (e.message ?: "No se pudo abrir el instalador").replace("'", "")
+                    val safe = (e.message ?: "Error al iniciar PackageInstaller").replace("'", "")
                     evalJs("window.__onAndroidUpdateError && window.__onAndroidUpdateError('$safe')")
                   }}
                 }}
@@ -288,7 +338,7 @@ jobs:
           }}
           '''
           main_act.write_text(kotlin_code, encoding="utf-8")
-          print("Patched AndroidManifest.xml and MainActivity.kt successfully")
+          print("Patched AndroidManifest.xml and MainActivity.kt (PackageInstaller.Session) successfully")
           PYEOF
 
           npx tauri android build --apk --target aarch64
