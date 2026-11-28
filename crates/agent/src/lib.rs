@@ -294,8 +294,14 @@ async fn run_agent_loop(
         });
 
         // disable_nagle = true (TCP_NODELAY) for minimum input & frame latency
-        match connect_async_with_config(&config.server_url, None, true).await {
-            Ok((ws_stream, _)) => {
+        let connect_res = tokio::time::timeout(
+            Duration::from_secs(12),
+            connect_async_with_config(&config.server_url, None, true),
+        )
+        .await;
+
+        match connect_res {
+            Ok(Ok((ws_stream, _))) => {
                 info!("Connected to server {}", config.server_url);
                 let should_stop =
                     handle_connection(ws_stream, &mut config, &event_tx, &mut cmd_rx).await;
@@ -303,15 +309,23 @@ async fn run_agent_loop(
                     info!("Agent stopped by command");
                     return;
                 }
+                let _ = event_tx.send(AgentEvent::Disconnected {
+                    reason: "Conexión perdida con el servidor, reconectando...".into(),
+                });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let msg = format!("Connection to {} failed: {}", config.server_url, e);
+                warn!("{}", msg);
+                let _ = event_tx.send(AgentEvent::Disconnected { reason: msg });
+            }
+            Err(_) => {
+                let msg = format!("Connection to {} timed out", config.server_url);
                 warn!("{}", msg);
                 let _ = event_tx.send(AgentEvent::Disconnected { reason: msg });
             }
         }
 
-        let sleep = tokio::time::sleep(Duration::from_secs(4));
+        let sleep = tokio::time::sleep(Duration::from_secs(2));
         tokio::pin!(sleep);
         tokio::select! {
             _ = &mut sleep => {}
@@ -391,7 +405,9 @@ async fn handle_connection(
     let input_tx = spawn_input_worker();
     let (p2p_in_tx, mut p2p_in_rx) = mpsc::unbounded_channel::<(String, SessionMessage)>();
 
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_server_activity = Instant::now();
     let mut stop_requested = false;
 
     loop {
@@ -403,8 +419,17 @@ async fn handle_connection(
             }
 
             _ = ping_interval.tick() => {
+                if writer.is_finished() {
+                    warn!("WebSocket writer closed unexpectedly; forcing reconnect");
+                    break;
+                }
+                if last_server_activity.elapsed() > Duration::from_secs(40) {
+                    warn!("No server heartbeat/Pong for >40s (stale socket); forcing reconnect");
+                    break;
+                }
                 let ts = chrono::Utc::now().timestamp_millis() as u64;
                 send_ws_signal(&out_tx, &SignalMessage::Ping { timestamp: ts });
+                let _ = out_tx.send(WsMessage::Ping(Vec::new().into()));
             }
 
             cmd = cmd_rx.recv() => {
@@ -478,16 +503,29 @@ async fn handle_connection(
                     break;
                 };
 
-                if let WsMessage::Text(text) = ws_msg {
-                    let Ok(signal) = serde_json::from_str::<SignalMessage>(&text) else {
-                        continue;
-                    };
+                last_server_activity = Instant::now();
 
-                    match signal {
-                        SignalMessage::Registered { device_id, server_version } => {
-                            info!("Registered as {} on server v{}", device_id, server_version);
-                            let _ = event_tx.send(AgentEvent::Registered { device_id, server_version });
-                        }
+                match ws_msg {
+                    WsMessage::Ping(payload) => {
+                        let _ = out_tx.send(WsMessage::Pong(payload));
+                        continue;
+                    }
+                    WsMessage::Pong(_) => {
+                        continue;
+                    }
+                    WsMessage::Close(_) => {
+                        break;
+                    }
+                    WsMessage::Text(text) => {
+                        let Ok(signal) = serde_json::from_str::<SignalMessage>(&text) else {
+                            continue;
+                        };
+
+                        match signal {
+                            SignalMessage::Registered { device_id, server_version } => {
+                                info!("Registered as {} on server v{}", device_id, server_version);
+                                let _ = event_tx.send(AgentEvent::Registered { device_id, server_version });
+                            }
 
                         SignalMessage::IncomingConnection {
                             session_id,
@@ -572,8 +610,8 @@ async fn handle_connection(
 
                         _ => {}
                     }
-                } else if let WsMessage::Close(_) = ws_msg {
-                    break;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -672,12 +710,9 @@ fn start_session(
     let last_clipboard_files = Arc::new(Mutex::new(initial_files));
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
 
-    // 1. Spawn remote audio capture & streaming task if permitted
+    // 1. Spawn remote audio capture & streaming task if permitted (strictly P2P — zero server relay)
     if permissions.allow_audio {
-        let sid = session_id.clone();
-        let e2e = e2e.clone();
         let active = settings.active.clone();
-        let out_tx = out_tx.clone();
         let p2p_audio = p2p.clone();
         let mut audio_rx = spawn_audio_capture(active.clone());
 
@@ -686,36 +721,23 @@ fn start_session(
                 if !active.load(Ordering::Relaxed) {
                     break;
                 }
+                if !p2p_audio.is_media_ready() {
+                    continue;
+                }
                 let mut plain = Vec::with_capacity(7 + chunk.pcm_i16_le.len());
                 plain.push(PACKET_AUDIO_PCM16);
                 plain.extend_from_slice(&chunk.sample_rate.to_be_bytes());
                 plain.extend_from_slice(&chunk.channels.to_be_bytes());
                 plain.extend_from_slice(&chunk.pcm_i16_le);
-
-                // Prefer direct WebRTC P2P DataChannel when open; fallback to E2E relay
-                if p2p_audio.is_media_ready() {
-                    let _ = p2p_audio.try_send_media(plain);
-                    continue;
-                }
-
-                if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
-                    let mut packet = Vec::with_capacity(36 + encrypted.len());
-                    packet.extend_from_slice(sid.as_bytes());
-                    packet.extend_from_slice(&encrypted);
-                    if out_tx.send(WsMessage::Binary(packet.into())).is_err() {
-                        break;
-                    }
-                }
+                let _ = p2p_audio.try_send_media(plain);
             }
         });
     }
 
-    // 2. Spawn dedicated OS thread for H.264 capture + encoding (P2P direct with automatic relay fallback)
+    // 2. Spawn dedicated OS thread for H.264 capture + encoding (strictly P2P — server is signaling-only)
     {
-        let sid = session_id.clone();
-        let e2e = e2e.clone();
+        let _ = video_tx;
         let settings = settings.clone();
-        let video_tx = video_tx.clone();
         let p2p_video = p2p.clone();
 
         std::thread::spawn(move || {
@@ -726,14 +748,12 @@ fn start_session(
             let session_start = Instant::now();
 
             while settings.active.load(Ordering::Relaxed) {
-                let using_p2p = p2p_video.is_media_ready();
-                // Backpressure: if transport hasn't drained previous frame, wait briefly before encoding
-                let saturated = if using_p2p {
-                    p2p_video.media_capacity() == 0
-                } else {
-                    video_tx.capacity() == 0
-                };
-                if saturated {
+                if !p2p_video.is_media_ready() {
+                    std::thread::park_timeout(Duration::from_millis(25));
+                    continue;
+                }
+                // Backpressure: if P2P channel hasn't drained previous frame, wait briefly before encoding
+                if p2p_video.media_capacity() == 0 {
                     std::thread::park_timeout(Duration::from_millis(3));
                     continue;
                 }
@@ -767,15 +787,8 @@ fn start_session(
                         plain.extend_from_slice(&encoded.h264_annex_b);
 
                         if p2p_video.is_media_ready() {
-                            // Direct P2P (DTLS-encrypted UDP/SCTP) — bypasses relay server completely!
+                            // Direct P2P (DTLS-encrypted UDP/SCTP) — zero traffic through relay server!
                             let _ = p2p_video.send_media_blocking(plain);
-                        } else if let Ok(encrypted) = e2e.encrypt_bytes(&plain) {
-                            let mut packet = Vec::with_capacity(36 + encrypted.len());
-                            packet.extend_from_slice(sid.as_bytes());
-                            packet.extend_from_slice(&encrypted);
-                            if video_tx.blocking_send(WsMessage::Binary(packet.into())).is_err() {
-                                break;
-                            }
                         }
 
                         let budget = Duration::from_millis(1000 / (fps as u64));

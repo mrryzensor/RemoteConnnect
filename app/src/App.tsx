@@ -140,7 +140,38 @@ function MainApp() {
   const [toast, setToast] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
   const [androidUpdateUrl, setAndroidUpdateUrl] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState<string>("0.1.18");
+  const [androidDownloadState, setAndroidDownloadState] = useState<
+    "idle" | "downloading" | "ready" | "error"
+  >("idle");
+  const [androidDownloadPct, setAndroidDownloadPct] = useState<number>(0);
+  const [androidDownloadErr, setAndroidDownloadErr] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string>("0.1.22");
+
+  useEffect(() => {
+    const w = window as unknown as {
+      __onAndroidUpdateProgress?: (pct: number) => void;
+      __onAndroidUpdateReady?: () => void;
+      __onAndroidUpdateError?: (msg: string) => void;
+    };
+    w.__onAndroidUpdateProgress = (pct: number) => {
+      setAndroidDownloadState("downloading");
+      setAndroidDownloadPct(Math.max(0, Math.min(100, Math.round(pct))));
+    };
+    w.__onAndroidUpdateReady = () => {
+      setAndroidDownloadPct(100);
+      setAndroidDownloadState("ready");
+      setAndroidDownloadErr(null);
+    };
+    w.__onAndroidUpdateError = (msg: string) => {
+      setAndroidDownloadState("error");
+      setAndroidDownloadErr(msg || "Error al descargar el APK");
+    };
+    return () => {
+      delete w.__onAndroidUpdateProgress;
+      delete w.__onAndroidUpdateReady;
+      delete w.__onAndroidUpdateError;
+    };
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -312,9 +343,11 @@ function MainApp() {
           androidUrl ||
           `https://github.com/mrryzensor/RemoteConnnect/releases/download/${tag}/RemoteConnect-Android-arm64.apk`;
         setAndroidUpdateUrl(apkUrl);
-        setUpdatingStatus(`Nueva versión ${tag} lista para instalar`);
-        window.open(apkUrl, "_blank", "noopener,noreferrer");
-        return `Abriendo descarga de ${tag} en el navegador...`;
+        setAndroidDownloadState("idle");
+        setAndroidDownloadPct(0);
+        setAndroidDownloadErr(null);
+        setUpdatingStatus(`Nueva versión ${tag} disponible`);
+        return `Nueva versión ${tag} disponible. Pulsa "Descargar actualización".`;
       }
 
       const exeUrl =
@@ -539,15 +572,58 @@ function MainApp() {
                 >
                   Cerrar
                 </button>
-                <a
-                  className="btn btn-primary btn-sm"
-                  href={androidUpdateUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{ textDecoration: "none" }}
-                >
-                  Descargar / Instalar APK
-                </a>
+                {androidDownloadState === "ready" ? (
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={() => {
+                      const bridge = (
+                        window as unknown as {
+                          AndroidUpdater?: { installApk?: () => void };
+                        }
+                      ).AndroidUpdater;
+                      if (bridge?.installApk) {
+                        bridge.installApk();
+                      } else if (androidUpdateUrl) {
+                        window.location.href = androidUpdateUrl;
+                      }
+                    }}
+                  >
+                    Instalar APK ahora
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={androidDownloadState === "downloading"}
+                    onClick={() => {
+                      const bridge = (
+                        window as unknown as {
+                          AndroidUpdater?: { downloadApk?: (url: string) => void };
+                        }
+                      ).AndroidUpdater;
+                      if (bridge?.downloadApk && androidUpdateUrl) {
+                        setAndroidDownloadState("downloading");
+                        setAndroidDownloadPct(0);
+                        setAndroidDownloadErr(null);
+                        bridge.downloadApk(androidUpdateUrl);
+                      } else if (androidUpdateUrl) {
+                        window.location.href = androidUpdateUrl;
+                      }
+                    }}
+                  >
+                    {androidDownloadState === "downloading"
+                      ? `Descargando... ${androidDownloadPct}%`
+                      : androidDownloadState === "error"
+                        ? "Reintentar descarga"
+                        : "Descargar actualización"}
+                  </button>
+                )}
+              </div>
+            )}
+            {androidDownloadErr && (
+              <div style={{ fontSize: 12, color: "#fca5a5", marginTop: 4 }}>
+                {androidDownloadErr}
               </div>
             )}
           </div>

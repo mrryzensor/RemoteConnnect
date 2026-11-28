@@ -380,7 +380,7 @@ export function SettingsModal({
                 Calidad predeterminada al conectar
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+              <div className="settings-quality-grid">
                 <div className="field">
                   <label>FPS ({prefs.default_fps})</label>
                   <select

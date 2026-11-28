@@ -405,24 +405,18 @@ export class RemoteViewerClient {
         this.sessionId = sessionId;
         this.e2e = await this.keyPair.deriveSession(hostPub, sessionId);
         await this.initVideoDecoder();
-        this.requestKeyframe();
-        if (this.preferP2p) {
-          void this.startP2pNegotiation();
-        }
+        // Always negotiate direct WebRTC P2P — server is used strictly for registration & signaling
+        void this.startP2pNegotiation();
 
         const permissions: SessionPermissions =
           (msg.permissions as SessionPermissions) || { ...DEFAULT_PERMISSIONS };
-        this.cb.onStatus("connected", "H.264 HW + E2E AES-256-GCM activo");
+        this.cb.onStatus("connecting", "Estableciendo túnel P2P directo...");
         this.cb.onSessionReady({
           sessionId,
           hostName: (msg.host_name as string) || "Equipo Remoto",
           displays: (msg.displays as DisplayInfo[]) || [],
           permissions,
         });
-        // Send immediate ping for initial RTT reading
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
-        }
         break;
       }
 
@@ -572,6 +566,7 @@ export class RemoteViewerClient {
         if (this.rtcMediaDc !== mediaDc) return;
         this.p2pMediaReady = true;
         this.cb.onTransportChange?.("p2p");
+        this.cb.onStatus("connected", "P2P Directo (DTLS/UDP) activo");
         this.requestKeyframe();
       };
       mediaDc.onclose = () => {
@@ -927,7 +922,8 @@ export class RemoteViewerClient {
         this.p2pControlReady = false;
       }
     }
-    return this.sendEncryptedViaWs(inner);
+    // Strictly P2P-only for session control/input/files (do not relay data over server)
+    return Promise.resolve();
   }
 
   requestKeyframe() {

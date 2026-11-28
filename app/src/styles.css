@@ -1085,19 +1085,83 @@ input::placeholder {
   border: 1px solid var(--border-strong);
   border-radius: 18px;
   width: 100%;
-  max-width: 520px;
+  max-width: min(520px, calc(100vw - 24px));
   max-height: 90vh;
   overflow-y: auto;
-  padding: 22px;
+  overflow-x: hidden;
+  padding: 20px;
   box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-width: 0;
   animation: scaleIn 0.16s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .modal-card.wide {
-  max-width: 780px;
+  max-width: min(780px, calc(100vw - 24px));
+}
+
+.modal-card > *,
+.modal-card .card,
+.modal-card .field,
+.modal-card .toggle-row,
+.modal-card .toggle-row > div {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.modal-card select,
+.modal-card input {
+  max-width: 100%;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.modal-card select {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-quality-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 640px) {
+  .modal-backdrop {
+    padding: 10px;
+  }
+  .modal-card,
+  .modal-card.wide {
+    padding: 16px;
+    max-width: calc(100vw - 20px);
+  }
+  .settings-quality-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-tabs {
+    flex-wrap: wrap;
+  }
+}
+
+html.is-android .settings-quality-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+html.is-android .modal-backdrop {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+html.is-android .modal-card,
+html.is-android .modal-card.wide {
+  padding: 16px;
+  max-width: calc(100vw - 20px);
 }
 
 .modal-header {

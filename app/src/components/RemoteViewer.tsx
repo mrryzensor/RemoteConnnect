@@ -83,12 +83,14 @@ export function RemoteViewer({
     (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
       window.matchMedia?.("(pointer: coarse)").matches);
 
-  const [touchMode, setTouchMode] = useState<"touch" | "cursor">("touch");
+  const [touchMode, setTouchMode] = useState<"touch" | "cursor">(
+    isTouchDevice ? "cursor" : "touch"
+  );
   const [zoom, setZoom] = useState<number>(1.0);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const zoomRef = useRef<number>(1.0);
   const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [showSpecialKeys, setShowSpecialKeys] = useState<boolean>(isTouchDevice);
+  const [showSpecialKeys, setShowSpecialKeys] = useState<boolean>(false);
   const [stickyMods, setStickyMods] = useState<{
     ctrl: boolean;
     shift: boolean;
