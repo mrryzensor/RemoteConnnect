@@ -156,18 +156,28 @@ html.is-android .viewer-shell.fullscreen .viewer-toolbar {
   padding-top: max(env(safe-area-inset-top, 0px), 32px);
 }
 
+html.is-android .viewer-shell.fullscreen .viewer-stage {
+  padding-top: max(env(safe-area-inset-top, 0px), 28px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
 /* Scrollbars */
 ::-webkit-scrollbar {
   width: 7px;
   height: 7px;
 }
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
 ::-webkit-scrollbar-thumb {
   background: var(--border-strong);
   border-radius: 999px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
@@ -537,11 +547,11 @@ input::placeholder {
   transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.switch input:checked + .switch-slider {
+.switch input:checked+.switch-slider {
   background: var(--accent);
 }
 
-.switch input:checked + .switch-slider::before {
+.switch input:checked+.switch-slider::before {
   transform: translateX(18px);
 }
 
@@ -613,7 +623,7 @@ input::placeholder {
   margin: 0 auto;
 }
 
-.main-area > section {
+.main-area>section {
   flex-shrink: 0;
 }
 
@@ -970,12 +980,15 @@ input::placeholder {
 
 .viewer-stage {
   flex: 1;
+  min-height: 0;
+  min-width: 0;
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
   outline: none;
+  touch-action: none;
 }
 
 .viewer-canvas-wrap {
@@ -986,23 +999,21 @@ input::placeholder {
   width: 100%;
   height: 100%;
   overflow: visible;
+  touch-action: none;
 }
 
 .viewer-canvas-box {
   position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
+  flex-shrink: 0;
   max-width: 100%;
   max-height: 100%;
 }
 
 .viewer-canvas {
   display: block;
-  max-width: 100%;
-  max-height: 100%;
-  width: auto;
-  height: auto;
+  width: 100%;
+  height: 100%;
   object-fit: contain;
   cursor: default;
   user-select: none;
@@ -1179,18 +1190,37 @@ input::placeholder {
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 @keyframes scaleIn {
-  from { opacity: 0; transform: scale(0.96); }
-  to { opacity: 1; transform: scale(1); }
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 @keyframes slideUp {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* ============================================================
@@ -1270,7 +1300,7 @@ input::placeholder {
     grid-template-columns: 1fr 75px auto;
   }
 
-  .file-row > :nth-child(3) {
+  .file-row> :nth-child(3) {
     display: none;
   }
 }
@@ -1397,8 +1427,17 @@ input::placeholder {
 }
 
 @keyframes widgetPulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.45; transform: scale(0.88); }
+
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.45;
+    transform: scale(0.88);
+  }
 }
 
 .settings-tabs {
@@ -1471,7 +1510,9 @@ input::placeholder {
 }
 
 @keyframes rcSpin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ============================================================

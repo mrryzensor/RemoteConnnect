@@ -102,6 +102,30 @@ export function RemoteViewer({
     y: 0.5,
   });
   const virtualCursorRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
+  const cursorElRef = useRef<SVGSVGElement | null>(null);
+  const videoSizeRef = useRef<{ w: number; h: number }>({ w: 1920, h: 1080 });
+  const [fitSize, setFitSize] = useState<{ width: number; height: number } | null>(null);
+  const fitSizeRef = useRef<{ width: number; height: number } | null>(null);
+
+  const recomputeFitSize = () => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const cs = window.getComputedStyle(stage);
+    const padX = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+    const padY = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    const availW = Math.max(1, stage.clientWidth - padX);
+    const availH = Math.max(1, stage.clientHeight - padY);
+    const { w: vw, h: vh } = videoSizeRef.current;
+    if (vw <= 0 || vh <= 0) return;
+    const ratio = Math.min(availW / vw, availH / vh);
+    const nextW = Math.max(1, Math.floor(vw * ratio));
+    const nextH = Math.max(1, Math.floor(vh * ratio));
+    const next = { width: nextW, height: nextH };
+    fitSizeRef.current = next;
+    setFitSize((prev) =>
+      prev && prev.width === nextW && prev.height === nextH ? prev : next
+    );
+  };
 
   const updateZoom = (nextZoom: number) => {
     const clamped = Math.max(1.0, Math.min(4.0, Math.round(nextZoom * 20) / 20));
@@ -211,6 +235,8 @@ export function RemoteViewer({
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
+          videoSizeRef.current = { w, h };
+          recomputeFitSize();
           canvasCtxRef.current = canvas.getContext("2d", {
             alpha: false,
             desynchronized: true,
@@ -235,6 +261,8 @@ export function RemoteViewer({
         if (canvas.width !== width || canvas.height !== height) {
           canvas.width = width;
           canvas.height = height;
+          videoSizeRef.current = { w: width, h: height };
+          recomputeFitSize();
           canvasCtxRef.current = canvas.getContext("2d", {
             alpha: false,
             desynchronized: true,
@@ -332,6 +360,22 @@ export function RemoteViewer({
     document.addEventListener("fullscreenchange", onFsChange);
     return () => document.removeEventListener("fullscreenchange", onFsChange);
   }, []);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    recomputeFitSize();
+    const ro = new ResizeObserver(() => recomputeFitSize());
+    ro.observe(stage);
+    const onResize = () => recomputeFitSize();
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+    };
+  }, [isFullscreen, showSpecialKeys, showSettings]);
 
   useEffect(() => {
     if (hideToolbarTimerRef.current !== null) {
@@ -442,8 +486,7 @@ export function RemoteViewer({
     setBitrateKbps(nextBitrateKbps);
     setSelectedDisplay(nextDisplay);
     setScale(nextScale);
-    const cursorFlag =
-      nextShowCursor !== undefined ? nextShowCursor : isTouchDevice && touchMode === "cursor";
+    const cursorFlag = nextShowCursor !== undefined ? nextShowCursor : false;
     clientRef.current?.sendStreamConfig(
       nextFps,
       nextBitrateKbps,
@@ -515,6 +558,8 @@ export function RemoteViewer({
     startY: number;
     lastX: number;
     lastY: number;
+    smoothDx: number;
+    smoothDy: number;
     moved: boolean;
     longPressTimer: number | null;
     rightClicked: boolean;
@@ -529,6 +574,8 @@ export function RemoteViewer({
     startY: 0,
     lastX: 0,
     lastY: 0,
+    smoothDx: 0,
+    smoothDy: 0,
     moved: false,
     longPressTimer: null,
     rightClicked: false,
@@ -580,6 +627,8 @@ export function RemoteViewer({
     ts.startY = t.clientY;
     ts.lastX = t.clientX;
     ts.lastY = t.clientY;
+    ts.smoothDx = 0;
+    ts.smoothDy = 0;
     ts.moved = false;
     ts.rightClicked = false;
     ts.wasTwoFinger = false;
@@ -654,12 +703,14 @@ export function RemoteViewer({
 
     const t = e.touches[0];
     if (!ts.moved) {
-      if (Math.hypot(t.clientX - ts.startX, t.clientY - ts.startY) <= 7) {
+      if (Math.hypot(t.clientX - ts.startX, t.clientY - ts.startY) <= 8) {
         return;
       }
       ts.moved = true;
       ts.lastX = t.clientX;
       ts.lastY = t.clientY;
+      ts.smoothDx = 0;
+      ts.smoothDy = 0;
       if (ts.longPressTimer !== null) {
         window.clearTimeout(ts.longPressTimer);
         ts.longPressTimer = null;
@@ -667,34 +718,64 @@ export function RemoteViewer({
     }
 
     if (touchMode === "cursor") {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const baseW = rect.width / Math.max(1, zoomRef.current);
-      const baseH = rect.height / Math.max(1, zoomRef.current);
-      const dx = ((t.clientX - ts.lastX) / Math.max(1, baseW)) * 1.45;
-      const dy = ((t.clientY - ts.lastY) / Math.max(1, baseH)) * 1.45;
+      const rawDx = t.clientX - ts.lastX;
+      const rawDy = t.clientY - ts.lastY;
+      const rawSpeed = Math.hypot(rawDx, rawDy);
+      if (rawSpeed < 0.75) {
+        return; // filter out capacitive digitizer micro-jitter
+      }
       ts.lastX = t.clientX;
       ts.lastY = t.clientY;
+
+      // Low-pass EMA smoothing + velocity-adaptive precision curve (slow = precise, fast = swift)
+      ts.smoothDx = ts.smoothDx * 0.48 + rawDx * 0.52;
+      ts.smoothDy = ts.smoothDy * 0.48 + rawDy * 0.52;
+      const smoothSpeed = Math.hypot(ts.smoothDx, ts.smoothDy);
+      const gain =
+        smoothSpeed <= 2.5
+          ? 0.62
+          : smoothSpeed >= 14
+            ? 1.35
+            : 0.62 + ((smoothSpeed - 2.5) / 11.5) * (1.35 - 0.62);
+
+      const baseW =
+        fitSizeRef.current?.width ||
+        e.currentTarget.getBoundingClientRect().width / Math.max(1, zoomRef.current);
+      const baseH =
+        fitSizeRef.current?.height ||
+        e.currentTarget.getBoundingClientRect().height / Math.max(1, zoomRef.current);
+      const dx = (ts.smoothDx / Math.max(1, baseW)) * gain;
+      const dy = (ts.smoothDy / Math.max(1, baseH)) * gain;
 
       const nx = Math.max(0, Math.min(1, virtualCursorRef.current.x + dx));
       const ny = Math.max(0, Math.min(1, virtualCursorRef.current.y + dy));
       virtualCursorRef.current = { x: nx, y: ny };
-      setVirtualCursor({ x: nx, y: ny });
 
-      // RustDesk-style auto-follow: pan the zoomed screen smoothly to follow the cursor
+      // Update SVG cursor DOM directly (zero React re-renders during drag)
+      if (cursorElRef.current) {
+        cursorElRef.current.style.left = `${nx * 100}%`;
+        cursorElRef.current.style.top = `${ny * 100}%`;
+      }
+
+      // Smooth damped RustDesk-style auto-follow pan when zoomed
       if (zoomRef.current > 1.02) {
         const z = zoomRef.current;
         const maxPanX = (baseW * (z - 1)) / 2;
         const maxPanY = (baseH * (z - 1)) / 2;
-        const nextPan = {
-          x: Math.max(-maxPanX, Math.min(maxPanX, (0.5 - nx) * baseW * (z - 1))),
-          y: Math.max(-maxPanY, Math.min(maxPanY, (0.5 - ny) * baseH * (z - 1))),
-        };
-        panRef.current = nextPan;
-        setPan(nextPan);
+        const targetPanX = Math.max(-maxPanX, Math.min(maxPanX, (0.5 - nx) * baseW * (z - 1)));
+        const targetPanY = Math.max(-maxPanY, Math.min(maxPanY, (0.5 - ny) * baseH * (z - 1)));
+        const curPan = panRef.current;
+        const nextPanX = curPan.x + (targetPanX - curPan.x) * 0.2;
+        const nextPanY = curPan.y + (targetPanY - curPan.y) * 0.2;
+        if (Math.hypot(nextPanX - curPan.x, nextPanY - curPan.y) > 0.6) {
+          const nextPan = { x: nextPanX, y: nextPanY };
+          panRef.current = nextPan;
+          setPan(nextPan);
+        }
       }
 
       const now = performance.now();
-      if (now - lastMoveSentRef.current < 16) return;
+      if (now - lastMoveSentRef.current < 20) return;
       lastMoveSentRef.current = now;
       clientRef.current?.sendMouseMove(nx, ny);
       return;
@@ -734,7 +815,14 @@ export function RemoteViewer({
       return;
     }
 
-    if (ts.wasTwoFinger || ts.rightClicked || ts.moved) return;
+    if (ts.wasTwoFinger || ts.rightClicked || ts.moved) {
+      if (touchMode === "cursor" && ts.moved) {
+        const cur = virtualCursorRef.current;
+        clientRef.current?.sendMouseMove(cur.x, cur.y);
+        setVirtualCursor({ ...cur });
+      }
+      return;
+    }
 
     if (touchMode === "cursor") {
       const cur = virtualCursorRef.current;
@@ -1321,7 +1409,14 @@ export function RemoteViewer({
             transformOrigin: "center center",
           }}
         >
-          <div className="viewer-canvas-box">
+          <div
+            className="viewer-canvas-box"
+            style={
+              fitSize
+                ? { width: `${fitSize.width}px`, height: `${fitSize.height}px` }
+                : undefined
+            }
+          >
             <canvas
               ref={canvasRef}
               className="viewer-canvas"
@@ -1337,6 +1432,7 @@ export function RemoteViewer({
             />
             {isTouchDevice && touchMode === "cursor" && (
               <svg
+                ref={cursorElRef}
                 className="virtual-cursor-arrow"
                 viewBox="0 0 24 24"
                 style={{

@@ -60,6 +60,10 @@ export function SettingsModal({
     ...(config.preferences ?? {}),
   };
 
+  const isAndroid =
+    typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+  const isDesktopTauri = isTauriEnv() && !isAndroid;
+
   const [tab, setTab] = useState<TabId>("general");
   const [prefs, setPrefs] = useState<UserPreferences>(initialPrefs);
   const [serverUrl, setServerUrl] = useState(config.server_url);
@@ -72,10 +76,10 @@ export function SettingsModal({
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    if (isTauriEnv()) {
+    if (isDesktopTauri) {
       void hasDesktopShortcut().then(setShortcutExists);
     }
-  }, []);
+  }, [isDesktopTauri]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -136,8 +140,8 @@ export function SettingsModal({
         </div>
 
         {tab === "general" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {isTauriEnv() && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
+            {isDesktopTauri && (
               <>
                 <div className="card" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                   <label className="toggle-row">
@@ -199,9 +203,9 @@ export function SettingsModal({
                 <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   <div className="field">
                     <label>Modo de interfaz de escritorio</label>
-                    <div style={{ display: "flex", gap: 8 }}>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
                       <select
-                        style={{ flex: 1 }}
+                        style={{ flex: "1 1 220px", minWidth: 0, maxWidth: "100%" }}
                         value={prefs.ui_mode}
                         onChange={(e) =>
                           setPrefs((p) => ({
@@ -210,9 +214,9 @@ export function SettingsModal({
                           }))
                         }
                       >
-                        <option value="auto">Automático (WebView2 si existe, sino Nativo Win32)</option>
-                        <option value="webview">WebView2 (Interfaz completa con visor integrado)</option>
-                        <option value="native">Nativo Win32 (Ultra ligero, sin WebView2)</option>
+                        <option value="auto">Automático (WebView2 / Nativo Win32)</option>
+                        <option value="webview">WebView2 (Interfaz completa)</option>
+                        <option value="native">Nativo Win32 (Ultra ligero)</option>
                       </select>
                       <button
                         type="button"
@@ -331,8 +335,8 @@ export function SettingsModal({
         )}
 
         {tab === "media" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {isTauriEnv() && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
+            {isDesktopTauri && (
               <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 <div className="field">
                   <label>Carpeta de grabaciones locales (.webm)</label>
