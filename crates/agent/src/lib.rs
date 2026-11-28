@@ -724,6 +724,14 @@ fn start_session(
                 if !p2p_audio.is_media_ready() {
                     continue;
                 }
+                // Silence gate: skip sending dead-silent PCM (~1.5 Mbps saved when no audio plays)
+                let has_sound = chunk
+                    .pcm_i16_le
+                    .chunks_exact(2)
+                    .any(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs() >= 18);
+                if !has_sound {
+                    continue;
+                }
                 let mut plain = Vec::with_capacity(7 + chunk.pcm_i16_le.len());
                 plain.push(PACKET_AUDIO_PCM16);
                 plain.extend_from_slice(&chunk.sample_rate.to_be_bytes());

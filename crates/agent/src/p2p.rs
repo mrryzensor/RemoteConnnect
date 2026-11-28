@@ -27,8 +27,11 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::send_encrypted_session_msg;
 
-/// Safe chunk payload size for SCTP DataChannels across all browsers/WebView2.
-const P2P_CHUNK_SIZE: usize = 32 * 1024;
+/// Safe chunk payload size for SCTP DataChannels over Internet UDP (lowers retransmit stalls).
+const P2P_CHUNK_SIZE: usize = 16 * 1024;
+/// Maximum SCTP send buffer before backpressure kicks in (prevents multi-second bufferbloat!).
+const P2P_MAX_BUFFERED_BYTES: usize = 128 * 1024;
+const P2P_RESUME_BUFFERED_BYTES: usize = 64 * 1024;
 
 pub struct P2pManager {
     session_id: String,
@@ -38,6 +41,7 @@ pub struct P2pManager {
     pending_candidates: Arc<Mutex<Vec<RTCIceCandidateInit>>>,
     remote_desc_set: Arc<AtomicBool>,
     media_ready: Arc<AtomicBool>,
+    media_congested: Arc<AtomicBool>,
     control_ready: Arc<AtomicBool>,
     media_tx: mpsc::Sender<Vec<u8>>,
     media_dc_slot: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
@@ -63,6 +67,7 @@ impl P2pManager {
         let media_dc_slot: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
         let control_dc_slot: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
         let media_ready = Arc::new(AtomicBool::new(false));
+        let media_congested = Arc::new(AtomicBool::new(false));
         let control_ready = Arc::new(AtomicBool::new(false));
         let pc_slot: Arc<Mutex<Option<Arc<RTCPeerConnection>>>> = Arc::new(Mutex::new(None));
         let pending_candidates: Arc<Mutex<Vec<RTCIceCandidateInit>>> =
@@ -70,10 +75,11 @@ impl P2pManager {
         let remote_desc_set = Arc::new(AtomicBool::new(false));
         let next_msg_id = Arc::new(AtomicU16::new(1));
 
-        // Pump media packets -> fragmented SCTP DataChannel messages
+        // Pump media packets -> fragmented SCTP DataChannel messages with strict bufferbloat control
         {
             let media_dc_for_pump = media_dc_slot.clone();
             let media_ready_for_pump = media_ready.clone();
+            let congested_for_pump = media_congested.clone();
             let msg_id_gen = next_msg_id.clone();
             tokio::spawn(async move {
                 while let Some(raw_packet) = media_rx.recv().await {
@@ -84,6 +90,30 @@ impl P2pManager {
                     let Some(dc) = dc_opt else {
                         continue;
                     };
+
+                    // Strict SCTP backpressure: never let SCTP queue build multi-second latency!
+                    let is_audio = raw_packet.first().copied() == Some(0x02);
+                    let mut buffered = dc.buffered_amount().await;
+                    if is_audio && buffered > P2P_RESUME_BUFFERED_BYTES {
+                        // Drop audio chunk under congestion so video & mouse stay ultra-responsive
+                        continue;
+                    }
+                    if buffered > P2P_MAX_BUFFERED_BYTES {
+                        congested_for_pump.store(true, Ordering::Release);
+                        let wait_start = std::time::Instant::now();
+                        while buffered > P2P_RESUME_BUFFERED_BYTES
+                            && media_ready_for_pump.load(Ordering::Relaxed)
+                            && wait_start.elapsed() < std::time::Duration::from_millis(250)
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            buffered = dc.buffered_amount().await;
+                        }
+                        congested_for_pump.store(buffered > P2P_MAX_BUFFERED_BYTES, Ordering::Release);
+                        if !media_ready_for_pump.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                    }
+
                     let msg_id = msg_id_gen.fetch_add(1, Ordering::Relaxed);
                     let total_chunks =
                         ((raw_packet.len() + P2P_CHUNK_SIZE - 1) / P2P_CHUNK_SIZE).max(1);
@@ -99,14 +129,18 @@ impl P2pManager {
                         framed.extend_from_slice(&total_u16.to_be_bytes());
                         framed.extend_from_slice(chunk);
                         if let Err(e) = dc.send(&Bytes::from(framed)).await {
-                            warn!("P2P media send failed (falling back to relay): {}", e);
+                            warn!("P2P media send failed: {}", e);
                             media_ready_for_pump.store(false, Ordering::Release);
+                            congested_for_pump.store(false, Ordering::Release);
                             failed = true;
                             break;
                         }
                     }
                     if failed {
                         *media_dc_for_pump.lock().await = None;
+                    } else {
+                        let post_buf = dc.buffered_amount().await;
+                        congested_for_pump.store(post_buf > P2P_MAX_BUFFERED_BYTES, Ordering::Release);
                     }
                 }
             });
@@ -120,6 +154,7 @@ impl P2pManager {
             pending_candidates,
             remote_desc_set,
             media_ready,
+            media_congested,
             control_ready,
             media_tx,
             media_dc_slot,
@@ -135,6 +170,9 @@ impl P2pManager {
 
     #[inline]
     pub fn media_capacity(&self) -> usize {
+        if self.media_congested.load(Ordering::Acquire) {
+            return 0;
+        }
         self.media_tx.capacity()
     }
 
@@ -302,10 +340,11 @@ impl P2pManager {
                             let on_ready = on_ready.clone();
                             let sid_open = sid_open.clone();
                             Box::pin(async move {
-                                info!(session_id = %sid_open, "P2P media DataChannel OPEN — switching video/audio to direct P2P!");
+                                info!(session_id = %sid_open, "P2P media DataChannel OPEN — starting direct P2P stream!");
                                 *media_slot_open.lock().await = Some(dc_open);
-                                media_ready_open.store(true, Ordering::Release);
+                                // Force IDR keyframe BEFORE enabling media_ready so the very first frame is an IDR
                                 on_ready();
+                                media_ready_open.store(true, Ordering::Release);
                             })
                         }));
 

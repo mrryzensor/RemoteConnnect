@@ -248,13 +248,14 @@ export class RemoteViewerClient {
             this.rtcControlDc.send(
               JSON.stringify({ kind: "p2p_ping", timestamp: Date.now() })
             );
+            // Keyframe watchdog: if still awaiting initial IDR keyframe, re-request it!
+            if (this.p2pMediaReady && this.awaitingKeyframe) {
+              this.requestKeyframe();
+            }
             return;
           } catch {
-            // fallback to ws ping
+            // ignore
           }
-        }
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
         }
       }, 2500);
 
@@ -536,6 +537,8 @@ export class RemoteViewerClient {
       controlDc.onopen = () => {
         if (this.rtcControlDc !== controlDc) return;
         this.p2pControlReady = true;
+        // Request an IDR keyframe as soon as control channel opens (prevents black screen!)
+        this.requestKeyframe();
         // Immediate P2P RTT probe
         try {
           controlDc.send(JSON.stringify({ kind: "p2p_ping", timestamp: Date.now() }));
@@ -612,7 +615,7 @@ export class RemoteViewerClient {
 
     let entry = this.p2pChunks.get(msgId);
     if (!entry) {
-      if (this.p2pChunks.size > 8) {
+      if (this.p2pChunks.size > 32) {
         const oldestKey = this.p2pChunks.keys().next().value;
         if (oldestKey !== undefined) this.p2pChunks.delete(oldestKey);
       }
