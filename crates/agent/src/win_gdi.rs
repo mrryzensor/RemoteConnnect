@@ -16,11 +16,74 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
     SRCCOPY,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+    DESKTOP_ACCESS_FLAGS, HDESK, UOI_NAME,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO,
 };
 
 use crate::capture::{get_display_bounds, DisplayBounds};
+
+fn desktop_name(hdesk: HDESK) -> Option<String> {
+    if hdesk.is_invalid() {
+        return None;
+    }
+    let mut buf = [0u16; 128];
+    let mut needed = 0u32;
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            windows::Win32::Foundation::HANDLE(hdesk.0),
+            UOI_NAME,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            (buf.len() * mem::size_of::<u16>()) as u32,
+            Some(&mut needed),
+        )
+        .is_ok()
+    };
+    if !ok {
+        return None;
+    }
+    let len = (needed as usize / 2).min(buf.len());
+    Some(
+        String::from_utf16_lossy(&buf[..len])
+            .trim_matches('\0')
+            .to_string(),
+    )
+}
+
+/// Attach the current OS thread to Windows' active input desktop (`Default`, `Winlogon` lock/login
+/// screen, or UAC secure desktop). Returns `true` if the thread switched to a different desktop.
+pub(crate) fn sync_thread_to_input_desktop() -> bool {
+    unsafe {
+        let Ok(input_desk) = OpenInputDesktop(
+            windows::Win32::System::StationsAndDesktops::DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(0x01FF),
+        ) else {
+            return false;
+        };
+        if input_desk.is_invalid() {
+            return false;
+        }
+        let cur_name = GetThreadDesktop(GetCurrentThreadId())
+            .ok()
+            .and_then(desktop_name);
+        let same = match (cur_name, desktop_name(input_desk)) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+            _ => false,
+        };
+        if same {
+            let _ = CloseDesktop(input_desk);
+            return false;
+        }
+        let switched = SetThreadDesktop(input_desk).is_ok();
+        let _ = CloseDesktop(input_desk);
+        switched
+    }
+}
 
 pub struct WinGdiCapturer {
     bounds: DisplayBounds,
@@ -110,7 +173,16 @@ impl WinGdiCapturer {
     /// Windows system cursor (arrow, hand, I-beam, resize, etc.) at its exact hotspot.
     pub fn capture_bgra(&mut self, draw_cursor: bool) -> Result<(&[u8], usize, usize)> {
         unsafe {
-            BitBlt(
+            // Switch capture thread to active input desktop (Winlogon lock screen / UAC / Default)
+            if sync_thread_to_input_desktop() {
+                let _ = ReleaseDC(None, self.screen_dc);
+                let new_dc = GetDC(None);
+                if !new_dc.is_invalid() {
+                    self.screen_dc = new_dc;
+                }
+            }
+
+            if BitBlt(
                 self.mem_dc,
                 0,
                 0,
@@ -121,7 +193,27 @@ impl WinGdiCapturer {
                 self.bounds.y,
                 SRCCOPY,
             )
-            .map_err(|e| anyhow!("BitBlt failed: {:?}", e))?;
+            .is_err()
+            {
+                // Re-acquire desktop DC once on transient desktop switch / lock screen transition
+                let _ = ReleaseDC(None, self.screen_dc);
+                let new_dc = GetDC(None);
+                if !new_dc.is_invalid() {
+                    self.screen_dc = new_dc;
+                }
+                BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    self.bounds.width as i32,
+                    self.bounds.height as i32,
+                    Some(self.screen_dc),
+                    self.bounds.x,
+                    self.bounds.y,
+                    SRCCOPY,
+                )
+                .map_err(|e| anyhow!("BitBlt failed: {:?}", e))?;
+            }
 
             if draw_cursor {
                 let mut ci = CURSORINFO {

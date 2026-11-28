@@ -146,6 +146,8 @@ jobs:
           import android.provider.Settings
           import android.webkit.JavascriptInterface
           import android.webkit.WebView
+          import android.widget.Toast
+          import androidx.activity.OnBackPressedCallback
           import java.io.File
           import java.io.FileInputStream
           import java.io.FileOutputStream
@@ -157,6 +159,7 @@ jobs:
             private var activeWebView: WebView? = null
             private var downloadedApk: File? = null
             private var installReceiverRegistered = false
+            private var lastBackPressMs = 0L
 
             private val installAction: String
               get() = applicationContext.packageName + ".INSTALL_UPDATE_RESULT"
@@ -199,6 +202,36 @@ jobs:
                 }}
                 installReceiverRegistered = true
               }}
+              onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {{
+                override fun handleOnBackPressed() {{
+                  val wv = activeWebView
+                  if (wv == null) {{
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                    return
+                  }}
+                  wv.evaluateJavascript("Boolean(window.__remoteConnectInViewer)") {{ res ->
+                    if (res == "true") {{
+                      val now = System.currentTimeMillis()
+                      if (now - lastBackPressMs <= 1800L) {{
+                        lastBackPressMs = 0L
+                        wv.evaluateJavascript("window.__onAndroidDoubleBack && window.__onAndroidDoubleBack()", null)
+                      }} else {{
+                        lastBackPressMs = now
+                        Toast.makeText(
+                          this@MainActivity,
+                          "Presiona atrás nuevamente para volver al panel",
+                          Toast.LENGTH_SHORT
+                        ).show()
+                      }}
+                    }} else {{
+                      isEnabled = false
+                      onBackPressedDispatcher.onBackPressed()
+                      isEnabled = true
+                    }}
+                  }}
+                }}
+              }})
             }}
 
             override fun onDestroy() {{

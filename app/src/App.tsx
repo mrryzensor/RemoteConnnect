@@ -108,7 +108,10 @@ function MainApp() {
   const [copiedField, setCopiedField] = useState<"id" | "pin" | null>(null);
   const [deviceQuery, setDeviceQuery] = useState("");
 
-  const [activeViewer, setActiveViewer] = useState<ActiveViewerSession | null>(null);
+  const [viewerTabs, setViewerTabs] = useState<
+    Array<ActiveViewerSession & { id: string; label: string }>
+  >([]);
+  const [activeTabId, setActiveTabId] = useState<string>("home");
 
   // Host-side incoming approval & active sessions
   const [pendingApproval, setPendingApproval] = useState<IncomingApproval | null>(null);
@@ -273,8 +276,22 @@ function MainApp() {
   }, []);
 
   useEffect(() => {
-    void setViewerMode(Boolean(activeViewer));
-  }, [activeViewer]);
+    const inViewer = viewerTabs.length > 0 && activeTabId !== "home";
+    void setViewerMode(inViewer);
+    const w = window as unknown as {
+      __remoteConnectInViewer?: boolean;
+      __onAndroidDoubleBack?: () => void;
+    };
+    w.__remoteConnectInViewer = inViewer;
+    w.__onAndroidDoubleBack = () => {
+      if (activeTabId !== "home") {
+        setActiveTabId("home");
+      }
+    };
+    return () => {
+      w.__remoteConnectInViewer = false;
+    };
+  }, [viewerTabs.length, activeTabId]);
 
   const checkAndAutoUpdate = async (manual = false): Promise<string> => {
     if (!isTauriEnv()) {
@@ -402,13 +419,13 @@ function MainApp() {
   };
 
   useEffect(() => {
-    if (!config || config.saved_devices.length === 0 || activeViewer) return;
+    if (!config || config.saved_devices.length === 0 || activeTabId !== "home") return;
     void refreshDeviceStatuses(config.server_url, config.saved_devices);
     const id = window.setInterval(() => {
       void refreshDeviceStatuses(config.server_url, config.saved_devices);
     }, 8000);
     return () => window.clearInterval(id);
-  }, [config?.server_url, config?.saved_devices, activeViewer]);
+  }, [config?.server_url, config?.saved_devices, activeTabId]);
 
   const onlineDevicesCount = useMemo(() => {
     if (!config) return 0;
@@ -444,56 +461,40 @@ function MainApp() {
     );
   }
 
-  if (activeViewer) {
-    return (
-      <>
-        <RemoteViewer
-          serverUrl={config.server_url}
-          targetDeviceId={activeViewer.targetDeviceId}
-          viewerName={config.device_name}
-          pin={activeViewer.pin}
-          authToken={config.auth_token}
-          preferences={config.preferences}
-          theme={theme}
-          onToggleTheme={toggleTheme}
-          onConnected={async ({ deviceId, hostName, pin }) => {
-            const existing = config.saved_devices.find((d) => d.id === deviceId);
-            const updatedList = await saveDevice({
-              id: deviceId,
-              name: existing?.name || hostName || deviceId,
-              pin: pin?.trim() ? pin.trim() : existing?.pin ?? null,
-              notes: existing?.notes ?? null,
-            });
-            setConfig((prev) =>
-              prev ? { ...prev, saved_devices: updatedList } : prev
-            );
-          }}
-          onExit={(msg) => {
-            setActiveViewer(null);
-            if (msg) notify(msg);
-          }}
-        />
-        {pendingApproval && (
-          <ApprovalModal
-            request={pendingApproval}
-            defaultPermissions={config.default_permissions}
-            onDecision={async (sid, ok, perms) => {
-              setPendingApproval(null);
-              await respondIncomingRequest(sid, ok, perms);
-            }}
-          />
-        )}
-      </>
-    );
-  }
-
   const startConnection = (rawId: string, pin?: string) => {
     const clean = normalizeDeviceId(rawId);
     if (!clean) {
       notify("Ingresa un ID de dispositivo válido");
       return;
     }
-    setActiveViewer({ targetDeviceId: clean, pin });
+    const existingSaved = config.saved_devices.find((d) => d.id === clean);
+    setViewerTabs((prev) => {
+      if (prev.some((t) => t.id === clean)) {
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          id: clean,
+          targetDeviceId: clean,
+          label: existingSaved?.name || formatDeviceId(clean),
+          pin,
+        },
+      ];
+    });
+    setActiveTabId(clean);
+  };
+
+  const closeViewerTab = (tabId: string, msg?: string) => {
+    setViewerTabs((prev) => {
+      const next = prev.filter((t) => t.id !== tabId);
+      setActiveTabId((cur) => {
+        if (cur !== tabId) return cur;
+        return next.length > 0 ? next[next.length - 1].id : "home";
+      });
+      return next;
+    });
+    if (msg) notify(msg);
   };
 
   const handleSaveServer = async () => {
@@ -545,8 +546,55 @@ function MainApp() {
     setConfig({ ...config, saved_devices: list });
   };
 
+  const isAndroid =
+    typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+
   return (
-    <div className="app-shell">
+    <div className="workspace-root">
+      {viewerTabs.length > 0 && (!isAndroid || activeTabId === "home") && (
+        <div className="desktop-tab-bar">
+          <button
+            type="button"
+            className={`desktop-tab ${activeTabId === "home" ? "active" : ""}`}
+            onClick={() => setActiveTabId("home")}
+            title="Volver al panel principal para abrir más equipos"
+          >
+            <Laptop size={13} />
+            <span>Inicio</span>
+          </button>
+          {viewerTabs.map((tab) => (
+            <div
+              key={tab.id}
+              className={`desktop-tab ${activeTabId === tab.id ? "active" : ""}`}
+              onClick={() => setActiveTabId(tab.id)}
+              title={`ID: ${formatDeviceId(tab.targetDeviceId)}`}
+            >
+              <span className="desktop-tab-dot" />
+              <span className="desktop-tab-label">{tab.label}</span>
+              <button
+                type="button"
+                className="desktop-tab-close"
+                title="Cerrar sesión"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeViewerTab(tab.id);
+                }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div
+        className="app-shell"
+        style={{
+          display: activeTabId === "home" ? "flex" : "none",
+          flex: 1,
+          minHeight: 0,
+        }}
+      >
       {updatingStatus && (
         <div className="auto-update-overlay">
           <div className="auto-update-card" style={{ flexDirection: "column", alignItems: "stretch" }}>
@@ -1410,7 +1458,50 @@ function MainApp() {
         </div>
       )}
 
-      {/* Incoming Connection Approval Modal */}
+      </div>
+
+      {/* Simultaneous multi-device viewer tabs (all stay connected in parallel!) */}
+      {viewerTabs.map((tab) => (
+        <div
+          key={tab.id}
+          className="tab-viewer-pane"
+          style={{
+            display: activeTabId === tab.id ? "flex" : "none",
+          }}
+        >
+          <RemoteViewer
+            serverUrl={config.server_url}
+            targetDeviceId={tab.targetDeviceId}
+            viewerName={config.device_name}
+            pin={tab.pin}
+            authToken={config.auth_token}
+            preferences={config.preferences}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            onConnected={async ({ deviceId, hostName, pin }) => {
+              const existing = config.saved_devices.find((d) => d.id === deviceId);
+              const resolvedName = existing?.name || hostName || deviceId;
+              setViewerTabs((prev) =>
+                prev.map((t) =>
+                  t.id === tab.id ? { ...t, label: resolvedName } : t
+                )
+              );
+              const updatedList = await saveDevice({
+                id: deviceId,
+                name: resolvedName,
+                pin: pin?.trim() ? pin.trim() : existing?.pin ?? null,
+                notes: existing?.notes ?? null,
+              });
+              setConfig((prev) =>
+                prev ? { ...prev, saved_devices: updatedList } : prev
+              );
+            }}
+            onExit={(msg) => closeViewerTab(tab.id, msg)}
+          />
+        </div>
+      ))}
+
+      {/* Incoming Connection Approval Modal (visible even while controlling another PC) */}
       {pendingApproval && (
         <ApprovalModal
           request={pendingApproval}

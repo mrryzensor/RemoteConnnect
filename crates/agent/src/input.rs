@@ -16,6 +16,8 @@ impl InputController {
     }
 
     pub fn move_mouse(&mut self, norm_x: f64, norm_y: f64, bounds: DisplayBounds) {
+        #[cfg(target_os = "windows")]
+        let _ = crate::win_gdi::sync_thread_to_input_desktop();
         let abs_x = bounds.x + (norm_x.clamp(0.0, 1.0) * (bounds.width as f64)).round() as i32;
         let abs_y = bounds.y + (norm_y.clamp(0.0, 1.0) * (bounds.height as f64)).round() as i32;
         if let Err(e) = self.enigo.move_mouse(abs_x, abs_y, Coordinate::Abs) {
@@ -57,6 +59,8 @@ impl InputController {
     }
 
     pub fn key_event(&mut self, code: &str, key: &str, pressed: bool) {
+        #[cfg(target_os = "windows")]
+        let _ = crate::win_gdi::sync_thread_to_input_desktop();
         let dir = if pressed {
             Direction::Press
         } else {

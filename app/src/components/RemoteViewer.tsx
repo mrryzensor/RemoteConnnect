@@ -584,6 +584,9 @@ export function RemoteViewer({
     moved: boolean;
     longPressTimer: number | null;
     rightClicked: boolean;
+    lastTapTime: number;
+    pendingDrag: boolean;
+    isDragging: boolean;
     twoFingerStartDist: number;
     twoFingerStartZoom: number;
     twoFingerMidX: number;
@@ -600,6 +603,9 @@ export function RemoteViewer({
     moved: false,
     longPressTimer: null,
     rightClicked: false,
+    lastTapTime: 0,
+    pendingDrag: false,
+    isDragging: false,
     twoFingerStartDist: 0,
     twoFingerStartZoom: 1,
     twoFingerMidX: 0,
@@ -644,6 +650,7 @@ export function RemoteViewer({
     }
 
     const t = e.touches[0];
+    const nowMs = performance.now();
     ts.startX = t.clientX;
     ts.startY = t.clientY;
     ts.lastX = t.clientX;
@@ -653,6 +660,10 @@ export function RemoteViewer({
     ts.moved = false;
     ts.rightClicked = false;
     ts.wasTwoFinger = false;
+    ts.isDragging = false;
+    // Double-tap-and-drag: second touch within 340ms of a tap arms left-button drag
+    ts.pendingDrag =
+      touchMode === "cursor" && nowMs - ts.lastTapTime <= 340;
 
     const useLongPress = effectivePrefs.right_click_gesture !== "two_finger_tap";
     if (e.touches.length === 1) {
@@ -668,7 +679,7 @@ export function RemoteViewer({
             }
           }, 460);
         }
-      } else if (useLongPress) {
+      } else if (useLongPress && !ts.pendingDrag) {
         ts.longPressTimer = window.setTimeout(() => {
           if (!ts.moved) {
             ts.rightClicked = true;
@@ -743,6 +754,14 @@ export function RemoteViewer({
       if (ts.longPressTimer !== null) {
         window.clearTimeout(ts.longPressTimer);
         ts.longPressTimer = null;
+      }
+      // Enter left-button drag mode (scrollbars, windows, files, text selection)
+      if (touchMode === "cursor" && ts.pendingDrag) {
+        ts.pendingDrag = false;
+        ts.isDragging = true;
+        const cur = virtualCursorRef.current;
+        clientRef.current?.sendMouseButton("left", true, cur.x, cur.y);
+        cursorElRef.current?.classList.add("dragging");
       }
     }
 
@@ -844,7 +863,20 @@ export function RemoteViewer({
       return;
     }
 
+    if (ts.isDragging) {
+      const cur = virtualCursorRef.current;
+      clientRef.current?.sendMouseButton("left", false, cur.x, cur.y);
+      ts.isDragging = false;
+      ts.pendingDrag = false;
+      ts.lastTapTime = 0;
+      cursorElRef.current?.classList.remove("dragging");
+      setVirtualCursor({ ...cur });
+      setPan({ ...panRef.current });
+      return;
+    }
+
     if (ts.wasTwoFinger || ts.rightClicked || ts.moved) {
+      ts.pendingDrag = false;
       if (ts.wasTwoFinger && e.touches.length === 0) {
         const finalZ = zoomRef.current <= 1.02 ? 1.0 : Math.round(zoomRef.current * 100) / 100;
         const finalPan = clampPan(finalZ, panRef.current.x, panRef.current.y);
@@ -867,6 +899,9 @@ export function RemoteViewer({
       const cur = virtualCursorRef.current;
       clientRef.current?.sendMouseButton("left", true, cur.x, cur.y);
       clientRef.current?.sendMouseButton("left", false, cur.x, cur.y);
+      // Record tap timestamp so a quick second touch + drag activates left-button drag
+      ts.lastTapTime = ts.pendingDrag ? 0 : performance.now();
+      ts.pendingDrag = false;
       return;
     }
 

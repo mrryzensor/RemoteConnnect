@@ -163,6 +163,10 @@ html.is-android .viewer-shell.fullscreen .viewer-stage {
   padding-right: env(safe-area-inset-right, 0px);
 }
 
+html.is-android .toast {
+  display: none !important;
+}
+
 /* Scrollbars */
 ::-webkit-scrollbar {
   width: 7px;
@@ -1029,6 +1033,97 @@ input::placeholder {
   pointer-events: none;
   z-index: 30;
   filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.55));
+  transition: filter 0.12s ease;
+}
+
+.virtual-cursor-arrow.dragging {
+  filter: drop-shadow(0 0 8px rgba(56, 189, 248, 0.95)) drop-shadow(0 2px 4px rgba(0, 0, 0, 0.65));
+}
+
+/* Simultaneous multi-device tabs (Desktop) */
+.workspace-root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.desktop-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.desktop-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 220px;
+  transition: background-color 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.desktop-tab:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.desktop-tab.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: rgba(14, 165, 233, 0.35);
+}
+
+.desktop-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--success);
+  flex-shrink: 0;
+}
+
+.desktop-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.desktop-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  color: var(--text-muted);
+  margin-left: 2px;
+}
+
+.desktop-tab-close:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.tab-viewer-pane {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  flex-direction: column;
 }
 
 .viewer-overlay-msg {

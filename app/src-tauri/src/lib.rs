@@ -212,6 +212,37 @@ fn deterministic_machine_device_id() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "android")]
+fn detect_device_name() -> String {
+    for prop in [
+        "persist.sys.device_name",
+        "ro.product.marketname",
+        "ro.product.model",
+    ] {
+        if let Ok(out) = std::process::Command::new("/system/bin/getprop")
+            .arg(prop)
+            .output()
+        {
+            if out.status.success() {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() && !val.eq_ignore_ascii_case("localhost") {
+                    return val;
+                }
+            }
+        }
+    }
+    "Android".into()
+}
+
+#[cfg(not(target_os = "android"))]
+fn detect_device_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "My-Desktop".into())
+}
+
 impl AppConfig {
     fn config_path() -> PathBuf {
         if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
@@ -234,14 +265,21 @@ impl AppConfig {
         for candidate in [&path, &bak_path] {
             if let Ok(raw) = fs::read_to_string(candidate) {
                 if let Ok(mut cfg) = serde_json::from_str::<Self>(&raw) {
-                    // Self-heal if loaded from backup
-                    if candidate == &bak_path {
-                        cfg.save();
-                    }
+                    let mut dirty = candidate == &bak_path;
                     // Ensure non-empty device_id
                     if cfg.device_id.trim().is_empty() {
                         cfg.device_id = deterministic_machine_device_id()
                             .unwrap_or_else(generate_device_id);
+                        dirty = true;
+                    }
+                    // Upgrade generic Android "localhost" name to real phone model/device name
+                    if cfg.device_name.trim().is_empty()
+                        || cfg.device_name.trim().eq_ignore_ascii_case("localhost")
+                    {
+                        cfg.device_name = detect_device_name();
+                        dirty = true;
+                    }
+                    if dirty {
                         cfg.save();
                     }
                     return cfg;
@@ -254,10 +292,7 @@ impl AppConfig {
             let _ = fs::copy(&path, path.with_extension("json.corrupt"));
         }
 
-        let default_name = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "My-Desktop".into());
+        let default_name = detect_device_name();
         let cfg = Self {
             device_id: deterministic_machine_device_id().unwrap_or_else(generate_device_id),
             device_name: default_name,
