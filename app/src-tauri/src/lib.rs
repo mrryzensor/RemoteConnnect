@@ -1,5 +1,7 @@
 #[cfg(not(target_os = "android"))]
 mod native_ui;
+#[cfg(target_os = "android")]
+mod android_host;
 
 use std::fs;
 use std::path::PathBuf;
@@ -10,6 +12,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use directories::{ProjectDirs, UserDirs};
 #[cfg(not(target_os = "android"))]
 use remoteconnect_agent::{start_agent, AgentConfig, AgentEvent, AgentHandle};
+#[cfg(target_os = "android")]
+use android_host::{start_android_host, AgentConfig, AgentEvent, AgentHandle};
 use remoteconnect_protocol::{generate_device_id, generate_pin, SessionPermissions};
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "android"))]
@@ -22,8 +26,7 @@ use tauri::{
     WindowEvent,
 };
 #[cfg(target_os = "android")]
-use tauri::{AppHandle, Manager, State};
-#[cfg(not(target_os = "android"))]
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,7 +335,6 @@ impl AppConfig {
 
 struct DesktopState {
     config: Mutex<AppConfig>,
-    #[cfg(not(target_os = "android"))]
     agent: Mutex<Option<AgentHandle>>,
     agent_status: Mutex<String>,
     active_sessions: Mutex<Vec<ActiveHostSessionInfo>>,
@@ -573,8 +575,64 @@ fn reveal_main_window(app: &AppHandle) {
 fn reveal_main_window(_app: &AppHandle) {}
 
 #[cfg(target_os = "android")]
-fn spawn_embedded_agent(_app: &AppHandle, state: &DesktopState) {
-    *state.agent_status.lock().unwrap() = "mobile-viewer".into();
+fn spawn_embedded_agent(app: &AppHandle, state: &DesktopState) {
+    let cfg = state.config.lock().unwrap().clone();
+    if let Some(old) = state.agent.lock().unwrap().take() {
+        old.stop();
+    }
+
+    let agent_cfg = AgentConfig {
+        server_url: cfg.server_url.clone(),
+        device_id: cfg.device_id.clone(),
+        device_name: cfg.device_name.clone(),
+        pin: cfg.pin.clone(),
+        pin_enabled: cfg.pin_enabled,
+        custom_password: cfg.custom_password.clone(),
+        custom_password_enabled: cfg.custom_password_enabled,
+        default_permissions: cfg.default_permissions,
+        auth_token: cfg.auth_token.clone(),
+    };
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let handle = tauri::async_runtime::block_on(async move { start_android_host(agent_cfg, ev_tx) });
+    *state.agent.lock().unwrap() = Some(handle);
+    *state.agent_status.lock().unwrap() = "connecting".into();
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = ev_rx.recv().await {
+            if let Some(st) = app_handle.try_state::<DesktopState>() {
+                match &ev {
+                    AgentEvent::Connecting { .. } => {
+                        *st.agent_status.lock().unwrap() = "connecting".into();
+                    }
+                    AgentEvent::Registered { .. } => {
+                        *st.agent_status.lock().unwrap() = "online".into();
+                    }
+                    AgentEvent::Disconnected { .. } => {
+                        *st.agent_status.lock().unwrap() = "offline".into();
+                    }
+                    AgentEvent::SessionStarted {
+                        session_id,
+                        viewer_name,
+                    } => {
+                        let mut list = st.active_sessions.lock().unwrap();
+                        list.retain(|s| s.session_id != *session_id);
+                        list.push(ActiveHostSessionInfo {
+                            session_id: session_id.clone(),
+                            viewer_name: viewer_name.clone(),
+                        });
+                    }
+                    AgentEvent::SessionEnded { session_id, .. } => {
+                        let mut list = st.active_sessions.lock().unwrap();
+                        list.retain(|s| s.session_id != *session_id);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = app_handle.emit("agent-event", &ev);
+        }
+    });
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1098,7 +1156,6 @@ fn update_access_settings(
     cfg.default_permissions = default_permissions;
     cfg.save();
 
-    #[cfg(not(target_os = "android"))]
     if let Some(handle) = state.agent.lock().unwrap().as_ref() {
         handle.update_access(
             pin,
@@ -1116,7 +1173,6 @@ fn regenerate_pin(state: State<'_, DesktopState>) -> AppConfig {
     let new_pin = generate_pin();
     let mut cfg = state.config.lock().unwrap();
     cfg.pin = new_pin.clone();
-    #[cfg(not(target_os = "android"))]
     {
         let pin_enabled = cfg.pin_enabled;
         let custom_pw = cfg.custom_password.clone();
@@ -1137,22 +1193,16 @@ fn respond_incoming_request(
     accepted: bool,
     permissions: SessionPermissions,
 ) {
-    #[cfg(not(target_os = "android"))]
     if let Some(handle) = state.agent.lock().unwrap().as_ref() {
         handle.respond_approval(session_id, accepted, permissions);
     }
-    #[cfg(target_os = "android")]
-    let _ = (state, session_id, accepted, permissions);
 }
 
 #[tauri::command]
 fn disconnect_host_session(state: State<'_, DesktopState>, session_id: String) {
-    #[cfg(not(target_os = "android"))]
     if let Some(handle) = state.agent.lock().unwrap().as_ref() {
         handle.disconnect_session(session_id);
     }
-    #[cfg(target_os = "android")]
-    let _ = (state, session_id);
 }
 
 #[tauri::command]
@@ -1228,16 +1278,8 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(DesktopState {
             config: Mutex::new(initial_cfg),
-            #[cfg(not(target_os = "android"))]
             agent: Mutex::new(None),
-            agent_status: Mutex::new(
-                if cfg!(target_os = "android") {
-                    "mobile-viewer"
-                } else {
-                    "offline"
-                }
-                .into(),
-            ),
+            agent_status: Mutex::new("offline".into()),
             active_sessions: Mutex::new(vec![]),
             viewer_active: AtomicBool::new(false),
         })

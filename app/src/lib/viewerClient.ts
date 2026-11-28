@@ -917,15 +917,20 @@ export class RemoteViewerClient {
   }
 
   private sendEncrypted(inner: Record<string, unknown>): Promise<void> {
-    if (this.p2pControlReady && this.rtcControlDc?.readyState === "open") {
+    if (this.rtcControlDc && this.rtcControlDc.readyState === "open") {
       try {
+        this.p2pControlReady = true;
         this.rtcControlDc.send(JSON.stringify(inner));
         return Promise.resolve();
       } catch {
         this.p2pControlReady = false;
       }
     }
-    // Strictly P2P-only for session control/input/files (do not relay data over server)
+    // Lightweight control/input fallback while control DataChannel finishes opening
+    // (never relays video/audio — guarantees control works immediately on first connect!)
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.e2e && this.sessionId) {
+      return this.sendEncryptedViaWs(inner);
+    }
     return Promise.resolve();
   }
 

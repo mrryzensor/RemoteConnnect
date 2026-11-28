@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -333,6 +334,11 @@ impl P2pManager {
                         let media_ready_open = media_ready.clone();
                         let on_ready = on_media_ready.clone();
                         let sid_open = sid.clone();
+                        let dc_check = dc.clone();
+                        let media_slot_check = media_slot.clone();
+                        let media_ready_check = media_ready.clone();
+                        let on_ready_check = on_media_ready.clone();
+                        let sid_check = sid.clone();
                         dc.on_open(Box::new(move || {
                             let dc_open = dc_open.clone();
                             let media_slot_open = media_slot_open.clone();
@@ -347,6 +353,13 @@ impl P2pManager {
                                 media_ready_open.store(true, Ordering::Release);
                             })
                         }));
+                        // Guard against race where DataChannel is already Open before on_open is registered
+                        if dc_check.ready_state() == RTCDataChannelState::Open {
+                            info!(session_id = %sid_check, "P2P media DataChannel already OPEN on arrival");
+                            *media_slot_check.lock().await = Some(dc_check);
+                            on_ready_check();
+                            media_ready_check.store(true, Ordering::Release);
+                        }
 
                         let media_slot_close = media_slot.clone();
                         let media_ready_close = media_ready.clone();
@@ -363,6 +376,10 @@ impl P2pManager {
                         let control_slot_open = control_slot.clone();
                         let control_ready_open = control_ready.clone();
                         let sid_open = sid.clone();
+                        let dc_check = dc.clone();
+                        let control_slot_check = control_slot.clone();
+                        let control_ready_check = control_ready.clone();
+                        let sid_check = sid.clone();
                         dc.on_open(Box::new(move || {
                             let dc_open = dc_open.clone();
                             let control_slot_open = control_slot_open.clone();
@@ -374,6 +391,12 @@ impl P2pManager {
                                 control_ready_open.store(true, Ordering::Release);
                             })
                         }));
+                        // Guard against race where control DataChannel is already Open on arrival
+                        if dc_check.ready_state() == RTCDataChannelState::Open {
+                            info!(session_id = %sid_check, "P2P control DataChannel already OPEN on arrival");
+                            *control_slot_check.lock().await = Some(dc_check);
+                            control_ready_check.store(true, Ordering::Release);
+                        }
 
                         let control_slot_close = control_slot.clone();
                         let control_ready_close = control_ready.clone();

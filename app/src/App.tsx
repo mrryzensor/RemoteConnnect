@@ -148,13 +148,19 @@ function MainApp() {
   >("idle");
   const [androidDownloadPct, setAndroidDownloadPct] = useState<number>(0);
   const [androidDownloadErr, setAndroidDownloadErr] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState<string>("0.1.22");
+  const [androidHostSharing, setAndroidHostSharing] = useState<boolean>(false);
+  const [androidA11yEnabled, setAndroidA11yEnabled] = useState<boolean>(false);
+  const [appVersion, setAppVersion] = useState<string>("0.1.29");
 
   useEffect(() => {
     const w = window as unknown as {
       __onAndroidUpdateProgress?: (pct: number) => void;
       __onAndroidUpdateReady?: () => void;
       __onAndroidUpdateError?: (msg: string) => void;
+      __onAndroidHostStatus?: (sharing: boolean) => void;
+      AndroidHost?: {
+        getHostStatusJson?: () => string;
+      };
     };
     w.__onAndroidUpdateProgress = (pct: number) => {
       setAndroidDownloadState("downloading");
@@ -169,10 +175,32 @@ function MainApp() {
       setAndroidDownloadState((prev) => (prev === "ready" ? "ready" : "error"));
       setAndroidDownloadErr(msg || "Error al descargar el APK");
     };
+    w.__onAndroidHostStatus = (sharing: boolean) => {
+      setAndroidHostSharing(Boolean(sharing));
+    };
+    const pollAndroidHost = () => {
+      try {
+        const raw = w.AndroidHost?.getHostStatusJson?.();
+        if (raw) {
+          const parsed = JSON.parse(raw) as {
+            screenSharing?: boolean;
+            accessibilityEnabled?: boolean;
+          };
+          setAndroidHostSharing(Boolean(parsed.screenSharing));
+          setAndroidA11yEnabled(Boolean(parsed.accessibilityEnabled));
+        }
+      } catch {
+        // ignore
+      }
+    };
+    pollAndroidHost();
+    const hostPollId = window.setInterval(pollAndroidHost, 2500);
     return () => {
+      window.clearInterval(hostPollId);
       delete w.__onAndroidUpdateProgress;
       delete w.__onAndroidUpdateReady;
       delete w.__onAndroidUpdateError;
+      delete w.__onAndroidHostStatus;
     };
   }, []);
 
@@ -859,41 +887,99 @@ function MainApp() {
                 Contraseña, PIN y Permisos
               </button>
 
-              <label
-                className="toggle-row"
-                style={{
-                  marginTop: 12,
-                  paddingTop: 12,
-                  borderTop: "1px solid var(--border)",
-                  fontSize: 12.5,
-                }}
-              >
-                <div>
-                  <strong style={{ fontWeight: 600 }}>Iniciar con Windows</strong>
-                  <div className="toggle-desc">En segundo plano (System Tray)</div>
-                </div>
-                <span className="switch">
-                  <input
-                    type="checkbox"
-                    checked={autostartEnabled}
-                    onChange={async (e) => {
-                      const next = e.target.checked;
-                      try {
-                        const res = await setAutostart(next);
-                        setAutostartEnabled(res);
-                        notify(
-                          res
-                            ? "RemoteConnect iniciará automáticamente con Windows"
-                            : "Inicio automático con Windows desactivado"
-                        );
-                      } catch {
-                        notify("No se pudo actualizar el inicio automático");
+              {isAndroid ? (
+                <div
+                  style={{
+                    marginTop: 12,
+                    paddingTop: 12,
+                    borderTop: "1px solid var(--border)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                  }}
+                >
+                  <div style={{ fontSize: 11.5, fontWeight: 700, color: "var(--text-secondary)" }}>
+                    Control remoto de este Android (Host)
+                  </div>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${androidHostSharing ? "btn-danger" : "btn-primary"}`}
+                    style={{ width: "100%" }}
+                    onClick={() => {
+                      const hostBridge = (
+                        window as unknown as {
+                          AndroidHost?: {
+                            requestScreenShare?: () => void;
+                            stopScreenShare?: () => void;
+                          };
+                        }
+                      ).AndroidHost;
+                      if (androidHostSharing) {
+                        hostBridge?.stopScreenShare?.();
+                      } else {
+                        hostBridge?.requestScreenShare?.();
                       }
                     }}
-                  />
-                  <span className="switch-slider" />
-                </span>
-              </label>
+                  >
+                    {androidHostSharing
+                      ? "Detener pantalla compartida"
+                      : "Compartir pantalla (Host)"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    style={{ width: "100%" }}
+                    onClick={() => {
+                      const hostBridge = (
+                        window as unknown as {
+                          AndroidHost?: { openAccessibilitySettings?: () => void };
+                        }
+                      ).AndroidHost;
+                      hostBridge?.openAccessibilitySettings?.();
+                    }}
+                  >
+                    {androidA11yEnabled
+                      ? "✓ Control táctil (Accesibilidad) activo"
+                      : "Habilitar control táctil (Accesibilidad)"}
+                  </button>
+                </div>
+              ) : (
+                <label
+                  className="toggle-row"
+                  style={{
+                    marginTop: 12,
+                    paddingTop: 12,
+                    borderTop: "1px solid var(--border)",
+                    fontSize: 12.5,
+                  }}
+                >
+                  <div>
+                    <strong style={{ fontWeight: 600 }}>Iniciar con Windows</strong>
+                    <div className="toggle-desc">En segundo plano (System Tray)</div>
+                  </div>
+                  <span className="switch">
+                    <input
+                      type="checkbox"
+                      checked={autostartEnabled}
+                      onChange={async (e) => {
+                        const next = e.target.checked;
+                        try {
+                          const res = await setAutostart(next);
+                          setAutostartEnabled(res);
+                          notify(
+                            res
+                              ? "RemoteConnect iniciará automáticamente con Windows"
+                              : "Inicio automático con Windows desactivado"
+                          );
+                        } catch {
+                          notify("No se pudo actualizar el inicio automático");
+                        }
+                      }}
+                    />
+                    <span className="switch-slider" />
+                  </span>
+                </label>
+              )}
             </>
           ) : (
             <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.55 }}>
