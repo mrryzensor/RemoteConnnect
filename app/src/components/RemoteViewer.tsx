@@ -90,6 +90,25 @@ export function RemoteViewer({
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const zoomRef = useRef<number>(1.0);
   const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const canvasWrapRef = useRef<HTMLDivElement | null>(null);
+
+  const clampPan = (z: number, px: number, py: number) => {
+    if (z <= 1.01) return { x: 0, y: 0 };
+    const baseW = fitSizeRef.current?.width || stageRef.current?.clientWidth || 800;
+    const baseH = fitSizeRef.current?.height || stageRef.current?.clientHeight || 450;
+    const maxPanX = (baseW * (z - 1)) / 2;
+    const maxPanY = (baseH * (z - 1)) / 2;
+    return {
+      x: Math.max(-maxPanX, Math.min(maxPanX, px)),
+      y: Math.max(-maxPanY, Math.min(maxPanY, py)),
+    };
+  };
+
+  const applyTransformDom = (z: number, px: number, py: number) => {
+    if (canvasWrapRef.current) {
+      canvasWrapRef.current.style.transform = `translate3d(${px.toFixed(2)}px, ${py.toFixed(2)}px, 0) scale(${z.toFixed(4)})`;
+    }
+  };
   const [showSpecialKeys, setShowSpecialKeys] = useState<boolean>(false);
   const [stickyMods, setStickyMods] = useState<{
     ctrl: boolean;
@@ -132,11 +151,11 @@ export function RemoteViewer({
   const updateZoom = (nextZoom: number) => {
     const clamped = Math.max(1.0, Math.min(4.0, Math.round(nextZoom * 20) / 20));
     zoomRef.current = clamped;
+    const nextPan = clampPan(clamped, panRef.current.x, panRef.current.y);
+    panRef.current = nextPan;
+    applyTransformDom(clamped, nextPan.x, nextPan.y);
     setZoom(clamped);
-    if (clamped <= 1.01) {
-      panRef.current = { x: 0, y: 0 };
-      setPan({ x: 0, y: 0 });
-    }
+    setPan(nextPan);
   };
 
   const [status, setStatus] = useState<
@@ -668,31 +687,39 @@ export function RemoteViewer({
     const ts = touchStateRef.current;
 
     if (e.touches.length === 2) {
+      e.preventDefault();
       const t0 = e.touches[0];
       const t1 = e.touches[1];
       const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
       const midX = (t0.clientX + t1.clientX) / 2;
       const midY = (t0.clientY + t1.clientY) / 2;
 
-      if (Math.abs(dist - ts.twoFingerStartDist) > 10) {
+      const prevZoom = zoomRef.current;
+      let nextZoom = prevZoom;
+      if (ts.twoFingerStartDist > 8 && Math.abs(dist - ts.twoFingerStartDist) > 2) {
         ts.twoFingerMoved = true;
-        if (ts.twoFingerStartDist > 10) {
-          const ratio = dist / ts.twoFingerStartDist;
-          updateZoom(ts.twoFingerStartZoom * ratio);
-        }
+        const ratio = dist / ts.twoFingerStartDist;
+        nextZoom = Math.max(1.0, Math.min(4.0, ts.twoFingerStartZoom * ratio));
       }
 
       const moveDx = midX - ts.twoFingerMidX;
       const moveDy = midY - ts.twoFingerMidY;
-      if (Math.hypot(moveDx, moveDy) > 6) {
+      if (Math.hypot(moveDx, moveDy) > 1.5 || nextZoom !== prevZoom) {
         ts.twoFingerMoved = true;
-        if (zoomRef.current > 1.05) {
-          const nextPan = {
-            x: Math.max(-600, Math.min(600, panRef.current.x + moveDx)),
-            y: Math.max(-600, Math.min(600, panRef.current.y + moveDy)),
-          };
+        if (nextZoom > 1.01 || prevZoom > 1.01) {
+          // Focal-point zoom + 2-finger pan directly on GPU compositor (0 React re-renders!)
+          const stageRect = stageRef.current?.getBoundingClientRect();
+          const cx = stageRect ? stageRect.left + stageRect.width / 2 : midX;
+          const cy = stageRect ? stageRect.top + stageRect.height / 2 : midY;
+          const scaleFactor = nextZoom / Math.max(1, prevZoom);
+          const focalX = midX - cx;
+          const focalY = midY - cy;
+          const rawPanX = focalX - (focalX - panRef.current.x) * scaleFactor + moveDx;
+          const rawPanY = focalY - (focalY - panRef.current.y) * scaleFactor + moveDy;
+          const nextPan = clampPan(nextZoom, rawPanX, rawPanY);
+          zoomRef.current = nextZoom;
           panRef.current = nextPan;
-          setPan(nextPan);
+          applyTransformDom(nextZoom, nextPan.x, nextPan.y);
           ts.twoFingerMidX = midX;
           ts.twoFingerMidY = midY;
         } else if (Math.abs(ts.lastY - midY) > 12) {
@@ -769,10 +796,10 @@ export function RemoteViewer({
         const curPan = panRef.current;
         const nextPanX = curPan.x + (targetPanX - curPan.x) * 0.2;
         const nextPanY = curPan.y + (targetPanY - curPan.y) * 0.2;
-        if (Math.hypot(nextPanX - curPan.x, nextPanY - curPan.y) > 0.6) {
+        if (Math.hypot(nextPanX - curPan.x, nextPanY - curPan.y) > 0.4) {
           const nextPan = { x: nextPanX, y: nextPanY };
           panRef.current = nextPan;
-          setPan(nextPan);
+          applyTransformDom(z, nextPan.x, nextPan.y);
         }
       }
 
@@ -818,10 +845,20 @@ export function RemoteViewer({
     }
 
     if (ts.wasTwoFinger || ts.rightClicked || ts.moved) {
+      if (ts.wasTwoFinger && e.touches.length === 0) {
+        const finalZ = zoomRef.current <= 1.02 ? 1.0 : Math.round(zoomRef.current * 100) / 100;
+        const finalPan = clampPan(finalZ, panRef.current.x, panRef.current.y);
+        zoomRef.current = finalZ;
+        panRef.current = finalPan;
+        applyTransformDom(finalZ, finalPan.x, finalPan.y);
+        setZoom(finalZ);
+        setPan(finalPan);
+      }
       if (touchMode === "cursor" && ts.moved) {
         const cur = virtualCursorRef.current;
         clientRef.current?.sendMouseMove(cur.x, cur.y);
         setVirtualCursor({ ...cur });
+        setPan({ ...panRef.current });
       }
       return;
     }
@@ -1405,9 +1442,10 @@ export function RemoteViewer({
         onDrop={handleDrop}
       >
         <div
+          ref={canvasWrapRef}
           className="viewer-canvas-wrap"
           style={{
-            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
             transformOrigin: "center center",
           }}
         >

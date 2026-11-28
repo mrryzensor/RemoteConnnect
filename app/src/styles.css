@@ -1000,6 +1000,7 @@ input::placeholder {
   height: 100%;
   overflow: visible;
   touch-action: none;
+  will-change: transform;
 }
 
 .viewer-canvas-box {
