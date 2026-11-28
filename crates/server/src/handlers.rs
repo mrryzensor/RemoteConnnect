@@ -83,7 +83,7 @@ pub async fn ws_handler(
 #[derive(Debug, Clone)]
 enum PeerRole {
     Unidentified,
-    Host { device_id: String },
+    Host { device_id: String, conn_id: Uuid },
     Viewer { session_id: String },
 }
 
@@ -124,9 +124,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
         }
     });
 
+    let conn_id = Uuid::new_v4();
     let mut role = PeerRole::Unidentified;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let next_msg = tokio::time::timeout(std::time::Duration::from_secs(75), ws_rx.next()).await;
+        let Some(Ok(msg)) = (match next_msg {
+            Ok(item) => item,
+            Err(_) => {
+                debug!(?role, "WebSocket idle timeout (75s), closing stale socket");
+                break;
+            }
+        }) else {
+            break;
+        };
         match msg {
             Message::Text(text) => {
                 let parsed: SignalMessage = match serde_json::from_str(&text) {
@@ -144,7 +155,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     }
                 };
 
-                handle_signal_message(parsed, &mut role, &peer_ch, &state);
+                handle_signal_message(parsed, conn_id, &mut role, &peer_ch, &state);
             }
             Message::Binary(bin) => {
                 // Fast-path E2E encrypted binary frame relay:
@@ -182,6 +193,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
 
 fn handle_signal_message(
     msg: SignalMessage,
+    conn_id: Uuid,
     role: &mut PeerRole,
     peer_ch: &PeerChannels,
     state: &Arc<ServerState>,
@@ -206,15 +218,20 @@ fn handle_signal_message(
                 return;
             }
             let normalized = normalize_device_id(&device_id);
-            info!(
-                device_id = %normalized,
-                device_name = %device_name,
-                os = %os,
-                "Host registered"
-            );
+            let is_refresh = matches!(role, PeerRole::Host { device_id: d, .. } if d == &normalized);
+            if !is_refresh {
+                info!(
+                    device_id = %normalized,
+                    device_name = %device_name,
+                    os = %os,
+                    conn_id = %conn_id,
+                    "Host registered"
+                );
+            }
             state.hosts.insert(
                 normalized.clone(),
                 HostPeer {
+                    conn_id,
                     device_id: normalized.clone(),
                     device_name,
                     os,
@@ -225,6 +242,7 @@ fn handle_signal_message(
             );
             *role = PeerRole::Host {
                 device_id: normalized.clone(),
+                conn_id,
             };
             send_signal(
                 tx,
@@ -384,9 +402,24 @@ fn handle_signal_message(
 
 fn cleanup_peer(role: &PeerRole, state: &Arc<ServerState>) {
     match role {
-        PeerRole::Host { device_id } => {
-            info!(device_id = %device_id, "Host disconnected");
-            state.hosts.remove(device_id);
+        PeerRole::Host { device_id, conn_id } => {
+            // CRITICAL: Only remove the host if this exact connection is still the active one!
+            // Prevents an old stale socket closing late from wiping a newly reconnected host.
+            let removed = state
+                .hosts
+                .remove_if(device_id, |_, host| host.conn_id == *conn_id)
+                .is_some();
+
+            if !removed {
+                debug!(
+                    device_id = %device_id,
+                    conn_id = %conn_id,
+                    "Ignoring cleanup for superseded host socket"
+                );
+                return;
+            }
+
+            info!(device_id = %device_id, conn_id = %conn_id, "Host disconnected");
 
             // Notify any viewers connected to this host
             let affected: Vec<String> = state

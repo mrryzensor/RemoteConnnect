@@ -18,6 +18,7 @@ pub struct PeerChannels {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct HostPeer {
+    pub conn_id: uuid::Uuid,
     pub device_id: String,
     pub device_name: String,
     pub os: String,

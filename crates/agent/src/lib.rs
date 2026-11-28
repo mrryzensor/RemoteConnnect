@@ -407,6 +407,7 @@ async fn handle_connection(
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ping_ticks: u64 = 0;
     let mut last_server_activity = Instant::now();
     let mut stop_requested = false;
 
@@ -427,9 +428,24 @@ async fn handle_connection(
                     warn!("No server heartbeat/Pong for >40s (stale socket); forcing reconnect");
                     break;
                 }
+                ping_ticks += 1;
                 let ts = chrono::Utc::now().timestamp_millis() as u64;
                 send_ws_signal(&out_tx, &SignalMessage::Ping { timestamp: ts });
                 let _ = out_tx.send(WsMessage::Ping(Vec::new().into()));
+
+                // RustDesk-style periodic registration heartbeat (every 45s):
+                // Guarantees this host stays registered on the server even if an older
+                // socket cleanup or transient server state glitch ever occurred.
+                if ping_ticks % 3 == 0 {
+                    let refresh = SignalMessage::RegisterHost {
+                        device_id: config.device_id.clone(),
+                        device_name: config.device_name.clone(),
+                        os: std::env::consts::OS.to_string(),
+                        auth_token: config.auth_token.clone(),
+                        unattended_enabled: config.unattended_enabled(),
+                    };
+                    send_ws_signal(&out_tx, &refresh);
+                }
             }
 
             cmd = cmd_rx.recv() => {
