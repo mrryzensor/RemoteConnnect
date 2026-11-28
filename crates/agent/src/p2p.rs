@@ -109,7 +109,7 @@ impl P2pManager {
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             buffered = dc.buffered_amount().await;
                         }
-                        congested_for_pump.store(buffered > P2P_MAX_BUFFERED_BYTES, Ordering::Release);
+                        congested_for_pump.store(false, Ordering::Release);
                         if !media_ready_for_pump.load(Ordering::Relaxed) {
                             continue;
                         }
@@ -139,9 +139,23 @@ impl P2pManager {
                     }
                     if failed {
                         *media_dc_for_pump.lock().await = None;
+                        congested_for_pump.store(false, Ordering::Release);
                     } else {
-                        let post_buf = dc.buffered_amount().await;
-                        congested_for_pump.store(post_buf > P2P_MAX_BUFFERED_BYTES, Ordering::Release);
+                        // Drain SCTP send buffer BEFORE returning to `media_rx.recv()`,
+                        // and ALWAYS clear `media_congested` so capture thread can NEVER deadlock!
+                        let mut post_buf = dc.buffered_amount().await;
+                        if post_buf > P2P_MAX_BUFFERED_BYTES {
+                            congested_for_pump.store(true, Ordering::Release);
+                            let drain_start = std::time::Instant::now();
+                            while post_buf > P2P_RESUME_BUFFERED_BYTES
+                                && media_ready_for_pump.load(Ordering::Relaxed)
+                                && drain_start.elapsed() < std::time::Duration::from_millis(300)
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                post_buf = dc.buffered_amount().await;
+                            }
+                        }
+                        congested_for_pump.store(false, Ordering::Release);
                     }
                 }
             });

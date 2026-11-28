@@ -724,8 +724,8 @@ export class RemoteViewerClient {
         this.awaitingKeyframe = false;
       }
 
-      // Prevent decoder queue buildup for ultra-low latency
-      if (this.videoDecoder.decodeQueueSize > 3 && !isKeyframe) {
+      // Prevent decoder queue buildup for ultra-low latency (allow headroom for cold HW init)
+      if (this.videoDecoder.decodeQueueSize > 6 && !isKeyframe) {
         this.awaitingKeyframe = true;
         this.requestKeyframe();
         return;
