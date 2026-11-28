@@ -824,6 +824,7 @@ fn parse_semver_tuple(v: &str) -> (u32, u32, u32) {
 
 #[tauri::command]
 async fn check_latest_release() -> Result<LatestReleaseInfo, String> {
+    #[allow(unused_variables)]
     let current_version = env!("CARGO_PKG_VERSION").to_string();
 
     #[cfg(target_os = "windows")]

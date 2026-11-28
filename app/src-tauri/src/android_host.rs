@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use remoteconnect_protocol::{
-    DisplayInfo, E2eKeyPair, E2eSession, MouseBtn, SessionMessage, SessionPermissions,
+    DisplayInfo, E2eSession, EphemeralKeyPair, MouseBtn, SessionMessage, SessionPermissions,
     SignalMessage,
 };
 use serde::Serialize;
@@ -897,7 +897,7 @@ fn start_session(
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     sessions: &mut HashMap<String, RunningSession>,
 ) {
-    let keypair = E2eKeyPair::generate();
+    let keypair = EphemeralKeyPair::generate();
     let host_pub = keypair.public_key_b64();
     let Ok(e2e) = keypair.derive_session(viewer_public_key, &session_id).map(Arc::new) else {
         return;
