@@ -163,7 +163,7 @@ function MainApp() {
       setAndroidDownloadErr(null);
     };
     w.__onAndroidUpdateError = (msg: string) => {
-      setAndroidDownloadState("error");
+      setAndroidDownloadState((prev) => (prev === "ready" ? "ready" : "error"));
       setAndroidDownloadErr(msg || "Error al descargar el APK");
     };
     return () => {
