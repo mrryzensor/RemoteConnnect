@@ -114,9 +114,8 @@ jobs:
 
       - name: Initialize & Build Android APK (Tauri 2)
         working-directory: app
-        env:
-          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
         run: |
+          export NDK_HOME="${ANDROID_HOME}/ndk/27.0.12077973"
           npx tauri android init --ci
 
           # Inject native Android in-app APK downloader & PackageInstaller bridge (window.AndroidUpdater)
@@ -249,7 +248,7 @@ jobs:
                   try {{
                     val uri = FileProvider.getUriForFile(
                       this@MainActivity,
-                      "${{applicationContext.packageName}}.updateprovider",
+                      applicationContext.packageName + ".updateprovider",
                       file
                     )
                     val intent = Intent(Intent.ACTION_VIEW).apply {{
